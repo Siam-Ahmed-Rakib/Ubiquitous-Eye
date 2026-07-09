@@ -1,0 +1,28 @@
+name: terrascope
+description: "Satellite imagery tasking app — map-based area-of-interest selection."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # Interactive map with pan / zoom + satellite tile layers
+  flutter_map: ^6.2.1
+  # Geographic primitives (LatLng) and Haversine distance for area calc
+  latlong2: ^0.9.1
+  # Geocoding the search bar via Nominatim (OpenStreetMap)
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

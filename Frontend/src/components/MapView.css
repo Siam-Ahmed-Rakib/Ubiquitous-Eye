@@ -1,0 +1,725 @@
+/* ============================================================
+   MapView.css  —  BD GeoSense interactive map view
+   ============================================================ */
+
+/* ── Root layout ──────────────────────────────────────────── */
+.mv-root {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    width: 100%;
+    background: var(--bg-base);
+    overflow: hidden;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+}
+
+/* ── Navbar ───────────────────────────────────────────────── */
+.mv-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    height: 56px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    position: relative;
+    z-index: var(--z-ui);
+}
+
+.mv-nav-l,
+.mv-nav-r {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* vertical divider */
+.mv-vdiv {
+    width: 1px;
+    height: 24px;
+    background: var(--border);
+    flex-shrink: 0;
+}
+
+/* ── Analysis pill ────────────────────────────────────────── */
+.mv-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 14px 5px 8px;
+    background: color-mix(in srgb, var(--pc) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pc) 30%, transparent);
+    border-radius: 999px;
+    transition: all var(--dur-normal) var(--ease-out);
+}
+
+.mv-pill-icon {
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.mv-pill-name {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--pc);
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+}
+
+.mv-pill-sub {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    line-height: 1;
+    margin-top: 1px;
+}
+
+/* ── Tile switcher buttons ────────────────────────────────── */
+.mv-tiles {
+    display: flex;
+    gap: 3px;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px;
+}
+
+.mv-tb {
+    padding: 4px 12px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--dur-fast) var(--ease-out);
+    white-space: nowrap;
+}
+
+.mv-tb:hover {
+    background: var(--bg-card);
+    color: var(--text-primary);
+}
+
+.mv-tb--on {
+    background: color-mix(in srgb, var(--tc) 18%, var(--bg-card));
+    color: var(--tc);
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+/* ── Body (map + sidebar) ─────────────────────────────────── */
+.mv-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    height: calc(100vh - 56px);
+    height: calc(100dvh - 56px);
+    overflow: hidden;
+}
+
+/* ── Map wrapper ──────────────────────────────────────────── */
+.mv-map-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* The Leaflet map container MUST use absolute inset — height:100%
+   does not work reliably when the parent is a flex item without an
+   explicit pixel height. */
+.mv-map {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    background: #0d1b2a;
+}
+
+/* ── Loading overlay ──────────────────────────────────────── */
+.mv-loader {
+    position: absolute;
+    inset: 0;
+    background: rgba(10, 14, 26, 0.88);
+    backdrop-filter: blur(10px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.mv-loader-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    text-align: center;
+}
+
+.mv-loader-ring {
+    filter: drop-shadow(0 0 12px currentColor);
+}
+
+.mv-loader-txt {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+    margin: 0;
+}
+
+/* ── Draw hint banner ─────────────────────────────────────── */
+.mv-draw-hint {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: var(--z-ui);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(17, 24, 39, 0.9);
+    border: 1px solid color-mix(in srgb, var(--ac) 40%, transparent);
+    border-radius: 999px;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    backdrop-filter: blur(12px);
+    box-shadow:
+        0 4px 20px rgba(0, 0, 0, 0.4),
+        0 0 0 1px color-mix(in srgb, var(--ac) 15%, transparent);
+    pointer-events: none;
+}
+
+.mv-draw-hint kbd {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.72rem;
+    color: var(--text-primary);
+}
+
+/* ── Status bar ───────────────────────────────────────────── */
+.mv-sb {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: var(--z-ui);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
+    min-height: 32px;
+}
+
+.mv-sb-l,
+.mv-sb-r {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.mv-sb-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    animation: pulse 2s ease-in-out infinite;
+}
+
+.mv-sb-txt {
+    color: var(--text-secondary);
+    font-size: 0.73rem;
+    font-weight: 500;
+}
+
+.mv-sb-vd {
+    width: 1px;
+    height: 14px;
+    background: var(--border);
+}
+
+.mv-sb-coords {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+}
+
+.mv-sb-hint {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-style: italic;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────── */
+.mv-sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    transition:
+        width var(--dur-normal) var(--ease-out),
+        opacity var(--dur-normal) var(--ease-out),
+        transform var(--dur-normal) var(--ease-out);
+}
+
+.mv-sidebar--open {
+    width: 300px;
+    opacity: 1;
+    transform: translateX(0);
+}
+
+.mv-sidebar--closed {
+    width: 0;
+    opacity: 0;
+    transform: translateX(16px);
+    pointer-events: none;
+    border-left-color: transparent;
+}
+
+/* ── Section ──────────────────────────────────────────────── */
+.mv-sec {
+    padding: 18px 18px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.mv-sec:last-child {
+    border-bottom: none;
+}
+
+.mv-sec-h {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+}
+
+.mv-sec-h svg {
+    flex-shrink: 0;
+    opacity: 0.7;
+}
+
+.mv-sec-p {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    line-height: 1.6;
+}
+
+.mv-sec-p strong {
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+/* ── Draw button ──────────────────────────────────────────── */
+.mv-draw-btn {
+    background: color-mix(in srgb, var(--bc) 12%, transparent);
+    border: 1.5px solid color-mix(in srgb, var(--bc) 35%, transparent);
+    color: var(--bc);
+    font-weight: 600;
+    transition: all var(--dur-normal) var(--ease-out);
+}
+
+.mv-draw-btn:hover {
+    background: color-mix(in srgb, var(--bc) 20%, transparent);
+    border-color: color-mix(in srgb, var(--bc) 60%, transparent);
+    box-shadow: 0 0 14px var(--bg);
+    transform: translateY(-1px);
+}
+
+.mv-draw-btn--on {
+    background: color-mix(in srgb, var(--bc) 20%, transparent) !important;
+    border-color: var(--bc) !important;
+    box-shadow: 0 0 18px var(--bg) !important;
+    animation: glowPulse 2s ease-in-out infinite;
+}
+
+/* Pulsing dot inside draw button */
+.mv-pdot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ── Bounds grid ──────────────────────────────────────────── */
+.mv-bounds-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.mv-bound {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transition: border-color var(--dur-fast);
+}
+
+.mv-bound:hover {
+    border-color: var(--border-hover);
+}
+
+.mv-bk {
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.mv-bv {
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-family: "JetBrains Mono", monospace;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+}
+
+/* ── Span row (Δ Lat / Δ Lng) ─────────────────────────────── */
+.mv-spans {
+    display: flex;
+    gap: 6px;
+}
+
+.mv-span {
+    flex: 1;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.mv-sk {
+    font-size: 0.63rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.mv-sv {
+    font-size: 0.82rem;
+    font-weight: 700;
+    font-family: "JetBrains Mono", monospace;
+    color: var(--accent-teal);
+}
+
+/* ── Selection action buttons ─────────────────────────────── */
+.mv-sel-btns {
+    display: flex;
+    gap: 8px;
+}
+
+/* ── Export button ────────────────────────────────────────── */
+.mv-exp-btn {
+    background: color-mix(in srgb, var(--bc) 12%, transparent);
+    border: 1.5px solid color-mix(in srgb, var(--bc) 35%, transparent);
+    color: var(--bc);
+    font-weight: 600;
+    position: relative;
+    overflow: hidden;
+    transition: all var(--dur-normal) var(--ease-out);
+}
+
+.mv-exp-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--bc) 22%, transparent);
+    border-color: color-mix(in srgb, var(--bc) 65%, transparent);
+    box-shadow: 0 0 20px var(--bg);
+    transform: translateY(-1px);
+}
+
+.mv-exp-btn--busy {
+    border-color: var(--bc) !important;
+}
+
+.mv-exp-btn--busy::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        90deg,
+        transparent,
+        rgba(255, 255, 255, 0.08),
+        transparent
+    );
+    animation: shimmer 1.2s ease-in-out infinite;
+    background-size: 200% 100%;
+}
+
+/* ── Export result card ───────────────────────────────────── */
+.mv-result {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 2px;
+}
+
+.mv-result-img-wrap {
+    position: relative;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    aspect-ratio: 16 / 10;
+    background: #0d1b2a;
+    box-shadow: var(--shadow-md);
+}
+
+.mv-result-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform var(--dur-slow) var(--ease-out);
+}
+
+.mv-result-img-wrap:hover .mv-result-img {
+    transform: scale(1.02);
+}
+
+.mv-result-badge {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+}
+
+/* ── Result metadata table ────────────────────────────────── */
+.mv-result-meta {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.mv-meta-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    transition: background var(--dur-fast);
+}
+
+.mv-meta-row:last-child {
+    border-bottom: none;
+}
+
+.mv-meta-row:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.mv-meta-k {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.mv-meta-v {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-family: "JetBrains Mono", monospace;
+    letter-spacing: -0.01em;
+}
+
+/* ── Toast notification ───────────────────────────────────── */
+.mv-toast {
+    position: fixed;
+    bottom: 48px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: var(--z-toast);
+    padding: 10px 20px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    white-space: nowrap;
+    pointer-events: none;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-lg);
+    color: var(--text-primary);
+}
+
+.mv-toast--success {
+    background: rgba(21, 128, 61, 0.25);
+    border-color: rgba(34, 197, 94, 0.4);
+    color: #86efac;
+}
+
+.mv-toast--error {
+    background: rgba(153, 27, 27, 0.25);
+    border-color: rgba(239, 68, 68, 0.4);
+    color: #fca5a5;
+}
+
+.mv-toast--info {
+    background: rgba(30, 64, 175, 0.25);
+    border-color: rgba(59, 130, 246, 0.4);
+    color: #93c5fd;
+}
+
+/* ── Leaflet draw toolbar overrides (dark theme) ──────────── */
+.leaflet-draw-toolbar a {
+    background-color: var(--bg-card) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border) !important;
+    width: 30px !important;
+    height: 30px !important;
+    line-height: 30px !important;
+    transition: background var(--dur-fast) !important;
+}
+
+.leaflet-draw-toolbar a:hover {
+    background-color: var(--bg-card-hover) !important;
+}
+
+.leaflet-draw-toolbar.leaflet-bar {
+    border-radius: var(--radius-md) !important;
+    overflow: hidden;
+    box-shadow: var(--shadow-md) !important;
+    border: 1px solid var(--border) !important;
+}
+
+.leaflet-draw-section {
+    border-color: var(--border) !important;
+}
+
+.leaflet-draw-tooltip {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-primary) !important;
+    border-radius: var(--radius-sm) !important;
+    font-size: 0.78rem !important;
+    box-shadow: var(--shadow-md) !important;
+}
+
+.leaflet-draw-tooltip-subtext {
+    color: var(--text-muted) !important;
+}
+
+.leaflet-draw-guide-dash {
+    background: rgba(255, 255, 255, 0.4) !important;
+}
+
+/* ── Leaflet zoom control overrides ───────────────────────── */
+.leaflet-control-zoom {
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+    overflow: hidden;
+    box-shadow: var(--shadow-md) !important;
+    margin-bottom: 36px !important;
+    margin-right: 14px !important;
+}
+
+.leaflet-control-zoom a {
+    background: var(--bg-card) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border) !important;
+    width: 32px !important;
+    height: 32px !important;
+    line-height: 32px !important;
+    font-size: 17px !important;
+    transition: background var(--dur-fast) !important;
+}
+
+.leaflet-control-zoom a:hover {
+    background: var(--bg-card-hover) !important;
+    color: #fff !important;
+}
+
+/* ── Leaflet attribution ──────────────────────────────────── */
+.leaflet-control-attribution {
+    background: rgba(10, 14, 26, 0.75) !important;
+    color: var(--text-muted) !important;
+    font-size: 9px !important;
+    backdrop-filter: blur(8px);
+    padding: 2px 6px !important;
+    border-top-left-radius: 4px !important;
+}
+
+.leaflet-control-attribution a {
+    color: var(--text-secondary) !important;
+}
+
+/* ── Responsive ───────────────────────────────────────────── */
+@media (max-width: 900px) {
+    .mv-sidebar--open {
+        width: 280px;
+    }
+}
+
+@media (max-width: 680px) {
+    .mv-sidebar--open {
+        position: absolute;
+        right: 0;
+        top: 56px;
+        bottom: 0;
+        width: 280px !important;
+        z-index: var(--z-overlay);
+        box-shadow: -4px 0 24px rgba(0, 0, 0, 0.5);
+    }
+
+    .mv-nav {
+        padding: 0 10px;
+        gap: 6px;
+    }
+
+    .mv-toast {
+        bottom: 44px;
+        left: 16px;
+        right: 16px;
+        transform: none;
+        text-align: center;
+        white-space: normal;
+        border-radius: 12px;
+    }
+}
+
+@media (max-width: 480px) {
+    .mv-pill {
+        padding: 4px 10px 4px 6px;
+    }
+
+    .mv-pill-name {
+        font-size: 0.78rem;
+    }
+}
+

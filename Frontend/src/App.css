@@ -1,0 +1,7 @@
+/* App.css — root wrapper fills full viewport */
+.app-root {
+    flex: 1;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+}

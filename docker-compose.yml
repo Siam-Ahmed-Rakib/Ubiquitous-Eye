@@ -1,0 +1,26 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: capstone-backend
+    environment:
+      SH_CLIENT_ID: ${SH_CLIENT_ID}
+      SH_CLIENT_SECRET: ${SH_CLIENT_SECRET}
+    volumes:
+      - ./server/GRANULE:/app/GRANULE
+      - ./Frontend/dist:/app/frontend_dist
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: capstone-frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped

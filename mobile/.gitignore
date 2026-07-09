@@ -1,0 +1,27 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated platform folders (run `flutter create .` locally)
+android/
+ios/
+web/
+linux/
+macos/
+windows/
