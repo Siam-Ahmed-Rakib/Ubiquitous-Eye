@@ -107,10 +107,11 @@ const List<AnalyticsService> kAnalyticsServices = [
     icon: Icons.layers_outlined,
     gradient: [Color(0xFFEF6C00), Color(0xFF26A69A)],
     description:
-        'Classifies every pixel of a scene into land-cover types — built-up, '
-        'vegetation, water, bare soil, roads, and more. Delivered as a labelled '
-        'raster, it gives a clear, up-to-date map of how land is used across '
-        'your area of interest, ready for planning and change analysis.',
+        'Classifies every pixel of a scene into land-cover types — tree cover, '
+        'crops, water bodies, and bare soil. Delivered as a labelled raster '
+        'drawn over the map, it gives a clear, up-to-date picture of how land '
+        'is used across your area of interest, ready for planning and change '
+        'analysis.',
   ),
   AnalyticsService(
     id: 'vegetation',

@@ -38,6 +38,9 @@ class AreaBounds {
   LatLng get se => LatLng(south, east);
   LatLng get center => LatLng((north + south) / 2, (east + west) / 2);
   LatLng get topCenter => LatLng(north, (east + west) / 2);
+  LatLng get bottomCenter => LatLng(south, (east + west) / 2);
+  LatLng get leftCenter => LatLng((north + south) / 2, west);
+  LatLng get rightCenter => LatLng((north + south) / 2, east);
 
   /// Area in km², from the Haversine width × height of the box.
   double get areaKm2 {

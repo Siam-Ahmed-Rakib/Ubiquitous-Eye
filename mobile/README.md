@@ -25,10 +25,17 @@ Flask `server/` in this repo, and is a self-contained Flutter project.
   service detail page, and an image-options step.
 - **Adaptive navigation** — a black bottom bar on phones; a left navigation
   rail on tablets / desktop / wide web.
+- **Laptop-friendly map controls** — see
+  [Desktop & touchpad controls](#desktop--touchpad-controls).
 - **Change analysis (backend-connected)** — after choosing an area, run the
   backend change-detection pipeline and see the result on the map: red =
   deforestation, orange = surface-water loss, plus pixel-count stats. See
-  [Backend integration](#backend-integration-change-analysis).
+  [Backend integration](#backend-integration).
+- **Land use classification (backend-connected)** — labels every pixel of the
+  selected area as tree, crop, water, or bare soil and paints it as a
+  semi-transparent colour map **directly on the Sentinel-2 scene it was computed
+  from**, with an opacity slider and a per-class area breakdown. See
+  [Land use classification](#land-use-classification).
 
 ## Responsive design
 
@@ -55,10 +62,20 @@ Applied throughout:
 OS text scaling is also clamped (`main.dart`) so very large accessibility font
 sizes can't overflow the app's fixed-height controls.
 
-## Backend integration (change analysis)
+## Backend integration
 
-The app talks to the repo's Flask backend (`server/api_server.py`) — the **same**
-`POST /api/sentinel/analyze` endpoint the React web `Frontend/` uses. Flow:
+The app talks to the repo's Flask backend (`server/api_server.py`). Which screen
+an area selection lands on depends on the service you picked:
+
+| Service | Screen | Endpoint |
+| --- | --- | --- |
+| Land Use Classification | Land Use | `POST /api/sentinel/classify` |
+| everything else, and the New Image tab | Change Analysis | `POST /api/sentinel/analyze` |
+
+### Change analysis
+
+Uses the **same** `POST /api/sentinel/analyze` endpoint the React web
+`Frontend/` does. Flow:
 
 1. Pick an area (New Image tab, or Analytics → a service → *Order* → *Select your
    area of interest*).
@@ -73,6 +90,87 @@ Relevant code:
 [`lib/services/analysis_service.dart`](lib/services/analysis_service.dart) (HTTP),
 [`lib/models/analysis_result.dart`](lib/models/analysis_result.dart) (parsing),
 [`lib/screens/analysis/analysis_run_screen.dart`](lib/screens/analysis/analysis_run_screen.dart) (UI).
+
+### Land use classification
+
+Analytics → **Land Use Classification** → *Order* → select an area → **CONTINUE**
+→ pick one month → **RUN CLASSIFICATION**.
+
+The backend builds a single Sentinel-2 composite, runs the same model ensemble
+the change pipeline uses, and labels every cell with one of four classes. Rather
+than shipping millions of points as JSON, it paints them into an RGBA PNG.
+
+It returns **two rasters**, both spanning the AOI's bounding box, base64-encoded:
+
+| Field | What it is |
+| --- | --- |
+| `baseImagePngBase64` | A true-colour render (`B04`/`B03`/`B02`, 2–98% stretch + gamma) of the composite |
+| `imagePngBase64` | The colour-mapped class labels |
+
+They are sampled from the **same grid** and upscaled by the **same integer
+factor**, so they are the same size and register cell for cell. The result
+screen has no map at all: it stacks the two in an `AspectRatio` box inside an
+`InteractiveViewer`, with the mask at 65% opacity over the imagery. The map is
+only used to pick the area.
+
+Drawing the mask on the pixels it was derived from — instead of on Esri's
+basemap mosaic — means what you see labelled is literally what the classifier
+read. A basemap is a different sensor on a different date, so any apparent
+misalignment there would be an artefact of the backdrop, not the model.
+
+| Class | Colour | Derived from |
+| --- | --- | --- |
+| Tree | green `#2E7D32` | vegetation with NDVI > 0.6 |
+| Crop | light green `#9CCC65` | vegetation with NDVI ≤ 0.6 |
+| Water | blue `#1565C0` | scene-classification water |
+| Soil | brown `#A1887F` | bare soil |
+
+`expand_class` also emits a **Building** label (bare soil with NDBI > 0), which
+this product does not report — `LAND_COVER_MERGE` in `server/api_server.py`
+folds it back into `Soil`. Change detection still uses both labels, so
+`inference/inference.py` is untouched.
+
+Cells with no cloud-free observation are left transparent **in both rasters**,
+and the panel reports what share of the area that was. The **opacity slider**
+and the **eye toggle** next to it fade or hide the mask so you can compare it
+against the bare scene. Classification runs at the composite's native 30 m; very
+large areas are strided coarser (the panel shows the actual m/px), which is why
+the imagery looks pixellated — that is the true data resolution, not a scaling
+artefact.
+
+The palette is defined once per side — `LAND_COVER_COLORS` in
+`server/api_server.py` and `kLandCoverPalette` in
+[`lib/models/land_use_result.dart`](lib/models/land_use_result.dart) — and the
+backend sends its hex colours with the response, so the legend can't drift.
+
+Relevant code:
+[`lib/services/land_use_service.dart`](lib/services/land_use_service.dart) (HTTP + sample data),
+[`lib/models/land_use_result.dart`](lib/models/land_use_result.dart) (parsing, palette),
+[`lib/screens/analysis/land_use_screen.dart`](lib/screens/analysis/land_use_screen.dart) (UI).
+
+## Desktop & touchpad controls
+
+The map is tuned for a laptop, not just a touchscreen
+([`lib/widgets/map_gestures.dart`](lib/widgets/map_gestures.dart)):
+
+- **Trackpad pinch zooms.** flutter_map 6 ignores `PointerScaleEvent` entirely,
+  so pinching a touchpad did nothing. `SmoothMapGestures` handles it, plus the
+  ctrl+wheel events browsers send in its place.
+- **Scroll-wheel zoom is normalised.** flutter_map zooms by
+  `scrollDelta.dy * 0.005` with no clamp; a touchpad fires dozens of small
+  scroll events a second, which sent the map flying. A mouse wheel's coarse
+  notches and a touchpad's fine deltas now both give a steady zoom rate.
+- **Explicit `+` / `−` buttons** sit at the bottom-right of every map.
+
+Selecting the area of interest is easier too
+([`lib/widgets/selection_overlay.dart`](lib/widgets/selection_overlay.dart)):
+
+- **Drag anywhere inside the box to move it** — not just the small centre dot.
+- **Edge handles** resize one side at a time; corner handles resize two.
+- Hit targets are much larger than the dots they draw (44 px corners, 48 px
+  edges), and the pointer shows **move / resize cursors** on hover.
+- A **lock button** below the zoom controls freezes the box, so a drag across it
+  pans the map instead of moving it.
 
 ### Pointing the app at the backend
 
@@ -102,8 +200,12 @@ python api_server.py           # serves on http://localhost:5000, CORS enabled
 > **No credentials yet?** The root `.env` ships with empty `SH_CLIENT_ID` /
 > `SH_CLIENT_SECRET`, so a real run returns *"Sentinel Hub credentials are
 > missing"* (surfaced in-app). Use the **“Load sample result”** button on the
-> analysis screen to see the visualization with illustrative, clearly-labelled
-> data — no backend or credentials needed.
+> analysis and land-use screens to see the visualization with illustrative,
+> clearly-labelled data — no backend or credentials needed.
+
+> **Port already taken?** Pass `--dart-define=BACKEND_URL=http://localhost:<port>`
+> to match wherever the backend is actually published (see the root
+> `docker-compose.yml`, and any `docker-compose.override.yml`).
 
 ## Project layout
 
@@ -116,9 +218,11 @@ lib/
     area_bounds.dart                 AOI box + km² area calculation
     analytics_service.dart           Service catalog data + filters
     analysis_result.dart             Change-detection result + stats models
+    land_use_result.dart             Land-cover raster, classes, palette
   services/
     geocoding_service.dart           Nominatim search + coordinate parsing
     analysis_service.dart            POST /api/sentinel/analyze + sample data
+    land_use_service.dart            POST /api/sentinel/classify + sample raster
   state/favourites.dart              Shared favourites store
   screens/
     main_scaffold.dart               App shell (adaptive nav rail / bottom bar)
@@ -126,6 +230,7 @@ lib/
     placeholder_tab.dart             Stand-in for not-yet-built tabs
     analysis/
       analysis_run_screen.dart       Run analysis: map overlay + dates + stats
+      land_use_screen.dart           Land cover: raster overlay + opacity + breakdown
     analytics/
       analytics_page.dart            Catalog (responsive grid)
       service_detail_page.dart       Service description + Order
@@ -135,6 +240,9 @@ lib/
     selection_overlay.dart           Rectangle, handles, area badge (map layer)
     search_panel.dart                Search field + results dropdown
     map_controls.dart                Layers / reset-box cluster
+    map_gestures.dart                Trackpad pinch + normalised wheel zoom
+    map_zoom_controls.dart           +/- zoom buttons and box-lock toggle
+    month_year_field.dart            Shared year + month picker
     category_filter_bar.dart         Analytics topic filters
     service_card.dart                Catalog grid tile
     service_thumbnail.dart           Generated service thumbnail

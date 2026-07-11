@@ -96,6 +96,69 @@ function evaluatePixel(sample) {
 }
 """
 
+# Cloud-free true-colour mosaic, fetched at native resolution just for display.
+# `isClear` drops exactly the SCL classes CLOUD_SCL_VALUES removes (cloud shadow 3,
+# cloud medium 8, cloud high 9, thin cirrus 10) plus no-data 0 and saturated 1,
+# then takes the per-pixel median of the remaining clear observations so a single
+# cloudy pass can't bleed through. Reflectance is emitted raw (0..1-ish); the
+# server applies its 2-98% stretch, so the exact scale here does not matter.
+# Visible-band reflectance above this is almost certainly cloud, not ground
+# (bright soil/roofs sit well below it). Catches haze/thin cloud the SCL layer
+# misses, which is what leaves bright white blobs and darkens the stretch.
+TRUE_COLOR_CLOUD_BRIGHTNESS = 0.35
+
+EVALSCRIPT_TRUE_COLOR = """
+//VERSION=3
+function setup() {
+    return {
+        input: [{ bands: ["B02", "B03", "B04", "SCL", "dataMask"] }],
+        output: [
+            { id: "rgb",  bands: 3, sampleType: "FLOAT32" },
+            { id: "mask", bands: 1, sampleType: "UINT8"   }
+        ],
+        mosaicking: "ORBIT"
+    };
+}
+
+var CLOUD_BRIGHT = __CLOUD_BRIGHT__;
+
+function isCloud(scl) { return scl == 3 || scl == 8 || scl == 9 || scl == 10; }
+function isVoid(scl)  { return scl == 0 || scl == 1; }
+
+function median(v) {
+    v.sort(function (a, b) { return a - b; });
+    var n = v.length, m = n >> 1;
+    return (n % 2) ? v[m] : 0.5 * (v[m - 1] + v[m]);
+}
+
+// Composite every pass in the month: for each pixel take the median of the clear
+// (non-cloud, non-bright) observations. Where nothing is clear — persistent
+// cloud — fall back to the darker quartile of whatever was seen, which dodges
+// bright cloud tops, so the pixel is filled instead of left as a black hole.
+function evaluatePixel(samples) {
+    var cr = [], cg = [], cb = [];
+    var all = [];
+    for (var i = 0; i < samples.length; i++) {
+        var s = samples[i];
+        if (s.dataMask != 1) continue;
+        var bright = (s.B02 + s.B03 + s.B04) / 3.0;
+        all.push({ b: bright, r: s.B04, g: s.B03, bl: s.B02 });
+        if (!isVoid(s.SCL) && !isCloud(s.SCL) && bright < CLOUD_BRIGHT) {
+            cr.push(s.B04); cg.push(s.B03); cb.push(s.B02);
+        }
+    }
+    if (cr.length > 0) {
+        return { rgb: [median(cr), median(cg), median(cb)], mask: [1] };
+    }
+    if (all.length > 0) {
+        all.sort(function (x, y) { return x.b - y.b; });
+        var p = all[Math.floor(all.length * 0.25)];
+        return { rgb: [p.r, p.g, p.bl], mask: [1] };
+    }
+    return { rgb: [0, 0, 0], mask: [0] };
+}
+""".replace("__CLOUD_BRIGHT__", repr(TRUE_COLOR_CLOUD_BRIGHTNESS))
+
 # ── Constants ─────────────────────────────────────────────────
 
 BAND_NAMES = ["B01", "B02", "B03", "B04", "B08", "B11", "B12"]
@@ -150,6 +213,18 @@ def determine_half(year: int, month: int) -> tuple[date, date]:
     """
     start = date(year, month, 1)
     end = date(year, month, 15)
+    return start, end
+
+
+def month_range(year: int, month: int) -> tuple[date, date]:
+    """First to last day of the given month.
+
+    The whole month yields ~6-8 Sentinel-2 passes instead of the ~2-3 in a half
+    month, so the temporal-median composite has enough clear looks to actually
+    remove clouds (the same approach as planet.py).
+    """
+    start = date(year, month, 1)
+    end = date(year, month, calendar.monthrange(year, month)[1])
     return start, end
 
 
@@ -213,6 +288,68 @@ def apply_cloud_mask(bands, cloud):
     masked = bands.copy()
     masked[cloud, :] = np.nan
     return masked
+
+
+def _true_color_size(bbox, target_resolution, max_px):
+    """Pixel size for a native-resolution true-colour request, capped at max_px."""
+    native = bbox_to_dimensions(bbox, resolution=target_resolution)
+    width, height = clamp_size(native[0], native[1])
+    longest = max(width, height)
+    if longest > max_px:
+        scale = max_px / longest
+        width, height = max(1, int(width * scale)), max(1, int(height * scale))
+    return width, height
+
+
+def fetch_true_color_base(
+    polygon_coords: list[list[float]],
+    year: int,
+    month: int,
+    client_id: str,
+    client_secret: str,
+    target_resolution: int = 10,
+    max_px: int = 1536,
+):
+    """Fetch a sharp, cloud-free Sentinel-2 true-colour scene for the AOI bbox.
+
+    This is display-only: the classification still runs on the 30 m composite the
+    models were trained on. Here we pull the RGB bands at their native 10 m and
+    let Sentinel Hub mosaic the whole month, masking clouds per pixel via SCL
+    (see EVALSCRIPT_TRUE_COLOR), so the backdrop under the mask is crisp and
+    cloud-free rather than a blown-up 30 m composite.
+
+    Returns ``(rgb, valid)`` where ``rgb`` is H×W×3 float32 in [B04, B03, B02]
+    order and ``valid`` is an H×W bool mask (False = cloud / no clear pixel).
+    """
+    lons = [pt[0] for pt in polygon_coords]
+    lats = [pt[1] for pt in polygon_coords]
+    bbox = BBox((min(lons), min(lats), max(lons), max(lats)), crs=CRS.WGS84)
+    size = _true_color_size(bbox, target_resolution, max_px)
+
+    start = date(year, month, 1)
+    end = date(year, month, calendar.monthrange(year, month)[1])
+    cfg = build_s2_config(client_id, client_secret)
+
+    req = SentinelHubRequest(
+        evalscript=EVALSCRIPT_TRUE_COLOR,
+        input_data=[SentinelHubRequest.input_data(
+            data_collection=DataCollection.SENTINEL2_L2A,
+            time_interval=(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+            mosaicking_order="leastCC",
+        )],
+        responses=[
+            SentinelHubRequest.output_response("rgb", MimeType.TIFF),
+            SentinelHubRequest.output_response("mask", MimeType.TIFF),
+        ],
+        bbox=bbox, size=size, config=cfg,
+    )
+    resp = req.get_data()[0]
+    rgb = resp["rgb.tif"].astype(np.float32)
+    mask = resp["mask.tif"]
+    mask = mask[:, :, 0] if mask.ndim == 3 else mask
+    valid = mask.astype(bool)
+    logger.info("True-colour base: size=%s, clear=%.1f%%", size, 100.0 * np.mean(valid))
+    return rgb, valid
 
 
 def collect_half(half_start, half_end, bbox, aoi_size, s2_cfg, ls_catalog_cfg, ls_cfg):
@@ -331,11 +468,14 @@ def run_composite_pipeline(
     month: int,
     client_id: str,
     client_secret: str,
+    whole_month: bool = False,
 ) -> pd.DataFrame:
     """
     End-to-end pipeline: polygon + year/month -> resampled 10 m DataFrame.
 
-    Uses the 1st half of the given month (days 1-15).
+    With ``whole_month`` (used by land-use classification) it collects every pass
+    in the month so the cloud-masked median composite has enough clear looks to
+    remove clouds. Otherwise it keeps the legacy 1st-half window (days 1-15).
     """
     lons = [pt[0] for pt in polygon_coords]
     lats = [pt[1] for pt in polygon_coords]
@@ -343,10 +483,12 @@ def run_composite_pipeline(
     native_size = bbox_to_dimensions(bbox, resolution=RESOLUTION)
     aoi_size = clamp_size(native_size[0], native_size[1])
 
-    logger.info("AOI bbox=(%s), size=%s, month=%d-%02d",
-                bbox, aoi_size, year, month)
+    logger.info("AOI bbox=(%s), size=%s, month=%d-%02d, whole_month=%s",
+                bbox, aoi_size, year, month, whole_month)
 
-    half_start, half_end = determine_half(year, month)
+    half_start, half_end = (
+        month_range(year, month) if whole_month else determine_half(year, month)
+    )
 
     s2_cfg = build_s2_config(client_id, client_secret)
     ls_cat_cfg = build_ls_catalog_config(client_id, client_secret)

@@ -5,6 +5,8 @@ and full change-detection analysis pipeline.
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import math
 import os
@@ -28,7 +30,7 @@ from sentinelhub import (
     bbox_to_dimensions,
 )
 
-from bimonthly_composite import run_composite_pipeline
+from bimonthly_composite import fetch_true_color_base, run_composite_pipeline
 from inference.inference import ensemble_predict, expand_class, get_mask
 
 
@@ -46,6 +48,43 @@ MIN_VALID_DATA_PCT = 30.0  # At least 30% non-zero pixels required
 
 # Cloud masking values (from planet.py — remove clouds during preprocessing)
 CLOUD_SCL_VALUES = [3, 8, 9, 10]  # Cloud Shadow, Medium/High Probability, Thin Cirrus
+
+# ── Land-use classification ───────────────────────────────────────────────
+# The labels this product reports, and the RGB the overlay paints them.
+# Colours are fully opaque here; the client blends the whole raster with its own
+# opacity so the basemap stays readable underneath.
+LAND_COVER_COLORS: dict[str, tuple[int, int, int]] = {
+    "Tree": (46, 125, 50),
+    "Crop": (156, 204, 101),
+    "Water": (21, 101, 192),
+    "Soil": (161, 136, 127),
+}
+
+# `expand_class` splits Sentinel-2's "Bare Soil" scene class in two: Building
+# where NDBI > 0, Soil otherwise. Land-use classification doesn't call out
+# built-up surfaces, so the split is folded back together here. Change detection
+# still relies on both labels — see `get_mask` in inference/inference.py.
+LAND_COVER_MERGE: dict[str, str] = {"Building": "Soil"}
+
+# Bands `ensemble_predict` needs; a NaN in any of them means the composite had
+# no cloud-free observation for that pixel, so it is left transparent.
+CLASSIFY_BAND_COLS = ["B01", "B02", "B03", "B04", "B08", "B11", "B12"]
+
+# Inference runs one row per cell, so cap how many cells a single request
+# classifies. Larger areas are strided down (coarser ground resolution).
+MAX_CLASSIFY_CELLS = 260_000
+
+# Rasters are upscaled (nearest-neighbour) before transport so the client does
+# not blur class edges when it stretches them to fill the viewport.
+MIN_OVERLAY_PX = 512
+MAX_OVERLAY_PX = 1536
+
+# True-colour render of the composite the classifier actually saw, so the mask
+# lines up with it pixel for pixel. A per-band 2–98% linear stretch handles the
+# fact that raw surface reflectance is very dark; gamma lifts the midtones.
+TRUE_COLOR_BANDS = ("B04", "B03", "B02")  # red, green, blue
+TRUE_COLOR_PERCENTILES = (2.0, 98.0)
+TRUE_COLOR_GAMMA = 0.8  # < 1 lifts midtones; brightens the cloud-free composite
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -568,6 +607,291 @@ def analyze_change():
         logger.exception("[%s] Validation error: %s", request_id, exc)
         return jsonify({"status": "error", "message": str(exc), "requestId": request_id}), 400
     except Exception as exc:
+        logger.exception("[%s] Unexpected error: %s", request_id, exc)
+        return jsonify({"status": "error", "message": str(exc), "requestId": request_id}), 500
+
+
+def _bbox_area_km2(west: float, south: float, east: float, north: float) -> float:
+    """Approximate area of a lat/lon box, using the mean latitude for the scale."""
+    lat_mid = math.radians((north + south) / 2.0)
+    km_per_deg_lat = 110.574
+    km_per_deg_lon = 111.320 * math.cos(lat_mid)
+    return abs(north - south) * km_per_deg_lat * abs(east - west) * km_per_deg_lon
+
+
+def _grid_shape(df: pd.DataFrame) -> tuple[int, int]:
+    """Recover the (rows, cols) of the 10 m grid `build_dataframe` flattened.
+
+    It flattens a meshgrid row-major, so the leading run of rows that share the
+    first latitude is exactly one grid row. The values come from the same array,
+    so exact float equality is safe here.
+    """
+    lat_vals = df["Latitude"].to_numpy()
+    cols = int(np.argmax(lat_vals != lat_vals[0]))
+    if cols == 0:  # every latitude identical — a single-row grid
+        cols = len(df)
+    return len(df) // cols, cols
+
+
+def _classify_labels(sub: pd.DataFrame) -> np.ndarray:
+    """Land-cover label per row of `sub`, or "" where the composite has no data.
+
+    Mirrors the split in `/api/sentinel/analyze`: pixels the Sentinel-2 scene
+    classification already resolved to Vegetation/Soil/Water (SCL 4/5/6) go
+    through `expand_class`, everything else through the model ensemble.
+    """
+    labels = np.full(len(sub), "", dtype=object)
+    valid = sub[CLASSIFY_BAND_COLS].notna().all(axis=1).to_numpy()
+    if not valid.any():
+        return labels
+
+    valid_pos = np.flatnonzero(valid)
+    work = sub.iloc[valid_pos].reset_index(drop=True)
+
+    scl_resolved = work["ClassID"].isin([4, 5, 6])
+    parts = []
+
+    unresolved = work.loc[~scl_resolved].copy()
+    if len(unresolved) > 0:
+        # Seed the column so `expand_class` can return it even if the ensemble
+        # predicts nothing in 4/5/6 for this tile.
+        unresolved["classifier"] = pd.NA
+        parts.append(ensemble_predict(unresolved))
+
+    resolved = work.loc[scl_resolved].copy()
+    if len(resolved) > 0:
+        b04, b08, b11 = resolved["B04"], resolved["B08"], resolved["B11"]
+        denom_ndvi = b08 + b04
+        resolved["NDVI"] = np.where(denom_ndvi != 0, (b08 - b04) / denom_ndvi, 0.0)
+        denom_ndbi = b11 + b08
+        resolved["NDBI"] = np.where(denom_ndbi != 0, (b11 - b08) / denom_ndbi, 0.0)
+        resolved["classifier"] = pd.NA
+        parts.append(expand_class(resolved))
+
+    # Both branches keep `work`'s positional index, so sorting realigns them.
+    combined = pd.concat(parts).sort_index()
+    values = combined["classifier"].to_numpy()
+    values = np.where(pd.isna(values), "", values)
+    for source, target in LAND_COVER_MERGE.items():
+        values = np.where(values == source, target, values)
+
+    labels[valid_pos] = values
+    return labels
+
+
+def _upscale_factor(width: int, height: int) -> int:
+    """Integer nearest-neighbour factor that lands the raster in a sane size."""
+    longest = max(width, height)
+    return max(1, min(MAX_OVERLAY_PX // longest, math.ceil(MIN_OVERLAY_PX / longest)))
+
+
+def _encode_png(img: Image.Image, scale: int) -> str:
+    """Upscale and base64-encode a raster. Nearest-neighbour keeps cells sharp."""
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _render_overlay(grid: np.ndarray) -> Image.Image:
+    """Paint a label grid into an RGBA image. Unlabelled cells stay transparent."""
+    height, width = grid.shape
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    for name, (red, green, blue) in LAND_COVER_COLORS.items():
+        rgba[grid == name] = (red, green, blue, 255)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _stretch_true_color(bands: list[np.ndarray], valid: np.ndarray) -> Image.Image:
+    """Percentile-stretch three RGB bands into an RGBA image.
+
+    Cells outside `valid` (no data / cloud) come back fully transparent so they
+    never tint the stretch or show through the mask.
+    """
+    height, width = valid.shape
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    if not valid.any():
+        return Image.fromarray(rgba, mode="RGBA")
+
+    for channel, band in enumerate(bands):
+        observed = band[valid]
+        low, high = np.percentile(observed, TRUE_COLOR_PERCENTILES)
+        if high <= low:  # a flat band — fall back to its full range
+            low, high = float(observed.min()), float(observed.max())
+        if high <= low:
+            high = low + 1e-6
+
+        stretched = np.clip((band - low) / (high - low), 0.0, 1.0)
+        stretched = np.where(valid, stretched, 0.0) ** TRUE_COLOR_GAMMA
+        rgba[..., channel] = (stretched * 255.0).astype(np.uint8)
+
+    rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _render_true_color(sub: pd.DataFrame, height: int, width: int) -> Image.Image:
+    """Render the 30 m composite's RGB bands as a viewable RGBA image.
+
+    This is the *same* composite the classifier consumed, sampled on the *same*
+    grid, so it registers with the mask cell for cell. Used as the backdrop only
+    when the sharper native-resolution fetch is unavailable.
+    """
+    bands = [
+        sub[name].to_numpy(dtype=np.float64).reshape(height, width)
+        for name in TRUE_COLOR_BANDS
+    ]
+    valid = np.ones((height, width), dtype=bool)
+    for band in bands:
+        valid &= np.isfinite(band)
+    return _stretch_true_color(bands, valid)
+
+
+def _render_base_true_color(rgb: np.ndarray, valid: np.ndarray) -> Image.Image:
+    """Stretch a fetched native-resolution true-colour array into an RGBA image.
+
+    `rgb` is H×W×3 in [B04, B03, B02] (red, green, blue) order, matching
+    TRUE_COLOR_BANDS; `valid` is the cloud/no-data mask from the fetch.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    bands = [rgb[..., 0], rgb[..., 1], rgb[..., 2]]
+    valid = np.asarray(valid, dtype=bool)
+    for band in bands:
+        valid = valid & np.isfinite(band)
+    return _stretch_true_color(bands, valid)
+
+
+@app.post("/api/sentinel/classify")
+def classify_land_use():
+    """Classify one date's composite into land-cover types.
+
+    Returns two pixel-aligned RGBA PNGs spanning the AOI's bounding box: a
+    true-colour render of the Sentinel-2 composite, and the colour-mapped class
+    labels to draw over it.
+    """
+    request_id = str(uuid.uuid4())[:8]
+    try:
+        logger.info("[%s] Incoming /api/sentinel/classify request", request_id)
+        payload = request.get_json(force=True, silent=False)
+
+        polygon = payload.get("polygon")
+        if not polygon or not isinstance(polygon, list) or len(polygon) < 3:
+            return jsonify({"status": "error", "message": "'polygon' with >=3 coords required"}), 400
+
+        now = datetime.utcnow()
+        year = int(payload.get("year", now.year))
+        month = int(payload.get("month", now.month))
+        if not 1 <= month <= 12:
+            return jsonify({"status": "error", "message": "'month' must be 1-12"}), 400
+
+        logger.info("[%s] date=%d-%02d  polygon=%d pts", request_id, year, month, len(polygon))
+
+        cfg = build_config()
+        # whole_month=True: composite every pass in the month so the cloud-masked
+        # median has enough clear looks to actually remove clouds (planet.py method).
+        df = run_composite_pipeline(
+            polygon, year, month, cfg.sh_client_id, cfg.sh_client_secret,
+            whole_month=True,
+        )
+
+        rows10, cols10 = _grid_shape(df)
+        rows30, cols30 = rows10 // 3, cols10 // 3
+        if rows30 < 1 or cols30 < 1:
+            raise RuntimeError(f"Composite grid too small to classify ({rows10}x{cols10})")
+
+        # The 10 m grid is a nearest-neighbour ×3 expansion of the 30 m composite,
+        # so sampling every 3rd cell (offset 1 = the centre) recovers the real
+        # 30 m pixels without inventing detail. Stride further if the AOI is big.
+        step = 1
+        while (rows30 // step) * (cols30 // step) > MAX_CLASSIFY_CELLS:
+            step += 1
+
+        row_idx = np.arange(0, rows30, step) * 3 + 1
+        col_idx = np.arange(0, cols30, step) * 3 + 1
+        flat_idx = (row_idx[:, None] * cols10 + col_idx[None, :]).ravel()
+        sub = df.iloc[flat_idx]
+        height, width = len(row_idx), len(col_idx)
+        logger.info(
+            "[%s] grid 10m=%dx%d -> classifying %dx%d cells (step=%d, %d m/px)",
+            request_id, rows10, cols10, height, width, step, 30 * step,
+        )
+
+        grid = _classify_labels(sub).reshape(height, width)
+
+        scale = _upscale_factor(width, height)
+        image_b64 = _encode_png(_render_overlay(grid), scale)
+        out_w, out_h = width * scale, height * scale
+
+        # Backdrop: a dedicated native-10 m, cloud-masked Sentinel-2 scene so the
+        # imagery under the mask is sharp (the 30 m classification composite is
+        # not). It spans the same bounding box, so the client still stacks the two
+        # by filling one aspect box — no cell-for-cell size match required. If the
+        # extra fetch fails (no creds/network), fall back to the composite render.
+        try:
+            rgb, valid = fetch_true_color_base(
+                polygon, year, month, cfg.sh_client_id, cfg.sh_client_secret,
+            )
+            base_image_b64 = _encode_png(_render_base_true_color(rgb, valid), 1)
+            logger.info("[%s] backdrop: native-resolution cloud-masked scene", request_id)
+        except Exception as exc:  # pragma: no cover - network/credentials dependent
+            logger.warning(
+                "[%s] hi-res backdrop fetch failed (%s); using 30 m composite render",
+                request_id, exc,
+            )
+            base_image_b64 = _encode_png(_render_true_color(sub, height, width), scale)
+
+        lons = [float(pt[0]) for pt in polygon]
+        lats = [float(pt[1]) for pt in polygon]
+        west, east = min(lons), max(lons)
+        south, north = min(lats), max(lats)
+        area_km2 = _bbox_area_km2(west, south, east, north)
+
+        total_cells = height * width
+        classes = []
+        classified = 0
+        for name, (red, green, blue) in LAND_COVER_COLORS.items():
+            count = int((grid == name).sum())
+            classified += count
+            classes.append({
+                "name": name,
+                "color": f"#{red:02X}{green:02X}{blue:02X}",
+                "pixels": count,
+                "percent": round(100.0 * count / total_cells, 2) if total_cells else 0.0,
+                "areaKm2": round(area_km2 * count / total_cells, 4) if total_cells else 0.0,
+            })
+        classes.sort(key=lambda c: c["pixels"], reverse=True)
+
+        logger.info(
+            "[%s] classified %d/%d cells: %s",
+            request_id, classified, total_cells,
+            {c["name"]: c["pixels"] for c in classes},
+        )
+
+        return jsonify({
+            "status": "success",
+            "message": f"Classified {classified} of {total_cells} cells",
+            "imagePngBase64": image_b64,
+            "baseImagePngBase64": base_image_b64,
+            "imageWidth": out_w,
+            "imageHeight": out_h,
+            "bounds": {"north": north, "south": south, "east": east, "west": west},
+            "classes": classes,
+            "stats": {
+                "gridWidth": width,
+                "gridHeight": height,
+                "totalCells": total_cells,
+                "classifiedCells": classified,
+                "resolutionMeters": 30 * step,
+                "areaKm2": round(area_km2, 4),
+                "date": f"{year}-{month:02d}",
+            },
+            "requestId": request_id,
+        })
+
+    except ValueError as exc:
+        logger.exception("[%s] Validation error: %s", request_id, exc)
+        return jsonify({"status": "error", "message": str(exc), "requestId": request_id}), 400
+    except Exception as exc:  # pylint: disable=broad-except
         logger.exception("[%s] Unexpected error: %s", request_id, exc)
         return jsonify({"status": "error", "message": str(exc), "requestId": request_id}), 500
 

@@ -150,6 +150,9 @@ class _OrderBar extends StatelessWidget {
       child: ResponsiveCenter(
         maxWidth: _kDetailMaxWidth,
         alignment: Alignment.center,
+        // The Scaffold hands its bottom bar loose constraints; without this the
+        // bar would stretch to the full screen height and leave the body none.
+        heightFactor: 1,
         child: SizedBox(
           height: 54,
           width: double.infinity,

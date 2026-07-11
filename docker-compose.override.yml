@@ -1,0 +1,9 @@
+# Local-only override (not the canonical config).
+# Host port 5000 is occupied by another project on this machine,
+# so expose the backend on 5001 instead. The frontend still reaches
+# the backend via the internal Docker network (service "backend:5000"),
+# so this only changes direct host access to the API.
+services:
+  backend:
+    ports: !override
+      - "5001:5000"

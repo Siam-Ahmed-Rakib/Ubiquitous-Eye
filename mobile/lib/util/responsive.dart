@@ -59,10 +59,19 @@ extension ResponsiveContext on BuildContext {
 /// Horizontally centres [child] and caps it at [maxWidth] so page content
 /// doesn't stretch edge-to-edge on tablets and wide desktop windows. On phones
 /// (where the available width is below [maxWidth]) it's a no-op passthrough.
+///
+/// Like [Align], this **fills the height it is offered**. Inside a slot that
+/// passes loose constraints — a Scaffold's `bottomNavigationBar`, for instance —
+/// that makes it swallow the whole screen and starve its siblings. Pass
+/// `heightFactor: 1` there to shrink-wrap the child's height instead.
 class ResponsiveCenter extends StatelessWidget {
   final double maxWidth;
   final EdgeInsetsGeometry padding;
   final Alignment alignment;
+
+  /// Forwarded to [Align.heightFactor]. Use `1` to size to the child's height.
+  final double? heightFactor;
+
   final Widget child;
 
   const ResponsiveCenter({
@@ -70,6 +79,7 @@ class ResponsiveCenter extends StatelessWidget {
     this.maxWidth = 640,
     this.padding = EdgeInsets.zero,
     this.alignment = Alignment.topCenter,
+    this.heightFactor,
     required this.child,
   });
 
@@ -77,6 +87,7 @@ class ResponsiveCenter extends StatelessWidget {
   Widget build(BuildContext context) {
     return Align(
       alignment: alignment,
+      heightFactor: heightFactor,
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxWidth),
         child: Padding(padding: padding, child: child),

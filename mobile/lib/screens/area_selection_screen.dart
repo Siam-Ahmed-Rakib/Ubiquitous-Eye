@@ -5,9 +5,12 @@ import 'package:latlong2/latlong.dart';
 import '../models/analytics_service.dart';
 import '../models/area_bounds.dart';
 import '../widgets/map_controls.dart';
+import '../widgets/map_gestures.dart';
+import '../widgets/map_zoom_controls.dart';
 import '../widgets/search_panel.dart';
 import '../widgets/selection_overlay.dart';
 import 'analysis/analysis_run_screen.dart';
+import 'analysis/land_use_screen.dart';
 
 /// A pannable satellite map with a rectangular area-of-interest selector.
 ///
@@ -43,16 +46,37 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
 
   static const LatLng _initialCenter = LatLng(23.7806, 90.3998); // Dhaka
 
+  static const double _minZoom = 2;
+  static const double _maxZoom = 18;
+
   final MapController _mapController = MapController();
 
   late AreaBounds _bounds;
   bool _draggingHandle = false;
   bool _satellite = true;
 
+  /// When locked the selection box ignores pointers, so a drag anywhere pans
+  /// the map instead of moving the box.
+  bool _boxLocked = false;
+
   @override
   void initState() {
     super.initState();
     _bounds = AreaBounds.square(center: _initialCenter, sizeKm: 5);
+  }
+
+  @override
+  void dispose() {
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  void _zoomBy(double delta) {
+    final camera = _mapController.camera;
+    _mapController.move(
+      camera.center,
+      (camera.zoom + delta).clamp(_minZoom, _maxZoom),
+    );
   }
 
   void _onLocationSelected(LatLng location) {
@@ -69,14 +93,14 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
   }
 
   void _continue() {
-    // Hand the chosen area (and any service context) to the analysis screen,
-    // which runs the backend change-detection pipeline and shows the result.
+    // Land Use Classification labels a single date; every other service (and
+    // the generic "New Image" flow) compares two dates for change.
+    final service = widget.service;
     Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => AnalysisRunScreen(
-          bounds: _bounds,
-          service: widget.service,
-        ),
+        builder: (_) => service?.id == 'land_use_classification'
+            ? LandUseScreen(bounds: _bounds, service: service)
+            : AnalysisRunScreen(bounds: _bounds, service: service),
       ),
     );
   }
@@ -90,6 +114,7 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
         children: [
           Positioned.fill(child: _buildMap()),
           _buildTopBar(),
+          _buildZoomControls(),
           _buildContinueButton(),
         ],
       ),
@@ -97,41 +122,59 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
   }
 
   Widget _buildMap() {
-    return FlutterMap(
-      mapController: _mapController,
-      options: MapOptions(
-        initialCenter: _initialCenter,
-        initialZoom: 12.5,
-        minZoom: 2,
-        maxZoom: 18,
-        backgroundColor: const Color(0xFF1A1A1A),
-        // Freeze map gestures while a selection handle is being dragged.
-        interactionOptions: InteractionOptions(
-          flags: _draggingHandle
-              ? InteractiveFlag.none
-              : InteractiveFlag.all & ~InteractiveFlag.rotate,
+    return SmoothMapGestures(
+      controller: _mapController,
+      minZoom: _minZoom,
+      maxZoom: _maxZoom,
+      enabled: !_draggingHandle,
+      child: FlutterMap(
+        mapController: _mapController,
+        options: MapOptions(
+          initialCenter: _initialCenter,
+          initialZoom: 12.5,
+          minZoom: _minZoom,
+          maxZoom: _maxZoom,
+          backgroundColor: const Color(0xFF1A1A1A),
+          // Freeze map gestures while a selection handle is being dragged.
+          interactionOptions: InteractionOptions(
+            flags: _draggingHandle ? InteractiveFlag.none : kSmoothInteractiveFlags,
+          ),
         ),
-      ),
-      children: [
-        TileLayer(
-          urlTemplate: _satellite ? _imageryUrl : _streetUrl,
-          userAgentPackageName: 'com.terrascope.app',
-          maxNativeZoom: 18,
-        ),
-        if (_satellite)
+        children: [
           TileLayer(
-            urlTemplate: _labelsUrl,
+            urlTemplate: _satellite ? _imageryUrl : _streetUrl,
             userAgentPackageName: 'com.terrascope.app',
             maxNativeZoom: 18,
           ),
-        AreaSelectionOverlay(
-          bounds: _bounds,
-          onChanged: (b) => setState(() => _bounds = b),
-          onDragStart: () => setState(() => _draggingHandle = true),
-          onDragEnd: () => setState(() => _draggingHandle = false),
-        ),
-        _buildAttribution(),
-      ],
+          if (_satellite)
+            TileLayer(
+              urlTemplate: _labelsUrl,
+              userAgentPackageName: 'com.terrascope.app',
+              maxNativeZoom: 18,
+            ),
+          AreaSelectionOverlay(
+            bounds: _bounds,
+            locked: _boxLocked,
+            onChanged: (b) => setState(() => _bounds = b),
+            onDragStart: () => setState(() => _draggingHandle = true),
+            onDragEnd: () => setState(() => _draggingHandle = false),
+          ),
+          _buildAttribution(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildZoomControls() {
+    return Positioned(
+      right: 16,
+      bottom: 88,
+      child: MapZoomControls(
+        onZoomIn: () => _zoomBy(1),
+        onZoomOut: () => _zoomBy(-1),
+        boxLocked: _boxLocked,
+        onToggleBoxLock: () => setState(() => _boxLocked = !_boxLocked),
+      ),
     );
   }
 
