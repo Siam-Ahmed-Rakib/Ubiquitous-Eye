@@ -31,6 +31,7 @@ from sentinelhub import (
 )
 
 from bimonthly_composite import fetch_true_color_base, run_composite_pipeline
+from cache import cache_get, cache_get_containing, cache_put
 from inference.inference import ensemble_predict, expand_class, get_mask
 
 
@@ -506,6 +507,33 @@ def analyze_change():
         logger.info("[%s] old=%d-%02d  new=%d-%02d  polygon=%d pts",
                      request_id, old_year, old_month, new_year, new_month, len(polygon))
 
+        # Result cache: change detection composites two whole months, so a repeat
+        # of the same area + date pair skips both Sentinel Hub fetches.
+        now = datetime.utcnow()
+        lons = [float(pt[0]) for pt in polygon]
+        lats = [float(pt[1]) for pt in polygon]
+        bbox_bounds = (min(lons), min(lats), max(lons), max(lats))
+        date_key = f"{old_year}-{old_month:02d}_{new_year}-{new_month:02d}"
+        is_current = (
+            (old_year, old_month) == (now.year, now.month)
+            or (new_year, new_month) == (now.year, now.month)
+        )
+
+        cached = cache_get("analyze", date_key, bbox_bounds, is_current)
+        if cached is not None:
+            logger.info("[%s] served change detection from cache", request_id)
+            return jsonify(cached)
+
+        # Phase 2: a smaller area fully inside a computed one is cropped from it.
+        contained = cache_get_containing("analyze", date_key, bbox_bounds, is_current)
+        if contained is not None:
+            try:
+                sub_result = _crop_analyze(contained, bbox_bounds)
+                logger.info("[%s] served change detection from a cached larger area (subset)", request_id)
+                return jsonify(sub_result)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[%s] subset crop failed (%s); computing fresh", request_id, exc)
+
         # Get Sentinel Hub credentials
         cfg = build_config()
         client_id = cfg.sh_client_id
@@ -589,7 +617,7 @@ def analyze_change():
 
         changes = changed[["Longitude", "Latitude", "mask"]].to_dict(orient="records")
 
-        return jsonify({
+        result = {
             "status": "success",
             "message": f"Analysis complete: {len(changed)} changed pixels detected",
             "changes": changes,
@@ -601,7 +629,9 @@ def analyze_change():
                 "newDate": f"{new_year}-{new_month:02d}",
             },
             "requestId": request_id,
-        })
+        }
+        cache_put("analyze", date_key, bbox_bounds, is_current, result)
+        return jsonify(result)
 
     except ValueError as exc:
         logger.exception("[%s] Validation error: %s", request_id, exc)
@@ -761,6 +791,162 @@ def _render_base_true_color(rgb: np.ndarray, valid: np.ndarray) -> Image.Image:
     return _stretch_true_color(bands, valid)
 
 
+# ── Cache subset serving (Phase 2) ─────────────────────────────────────────
+# A request for a smaller area that sits fully inside a previously-computed one
+# is served by cropping the cached result — no Sentinel Hub fetch. The land-cover
+# label grid is stored (as compact int codes) alongside the response so the
+# overlay can be re-rendered and class stats recomputed exactly for the sub-area.
+_CODE_TO_LABEL = ["", "Tree", "Crop", "Water", "Soil"]
+_LABEL_TO_CODE = {name: i for i, name in enumerate(_CODE_TO_LABEL)}
+
+
+def _encode_grid(grid: np.ndarray) -> list[list[int]]:
+    """Land-cover label grid -> nested int codes (compact, JSON-friendly)."""
+    return [[int(_LABEL_TO_CODE.get(v, 0)) for v in row] for row in grid]
+
+
+def _decode_grid(codes: list[list[int]]) -> np.ndarray:
+    """Nested int codes -> object array of label strings."""
+    return np.array(
+        [[_CODE_TO_LABEL[int(c)] for c in row] for row in codes], dtype=object
+    )
+
+
+def _clamp_int(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def _crop_classify(contained: dict, req_bbox: tuple) -> dict:
+    """Build a fresh classify response for ``req_bbox`` from a cached larger area.
+
+    ``contained`` is what ``cache_get_containing`` returns: the cached payload,
+    the stored label grid (extras), and the cached bounds. We slice the grid to
+    the requested sub-box, re-render the overlay, crop the stored backdrop PNG,
+    and recompute the class stats for the sub-area.
+    """
+    payload = contained["payload"]
+    extras = contained["extras"]
+    cw, cs, ce, cn = contained["bounds"]
+    rw, rs, re_, rn = req_bbox
+
+    grid = _decode_grid(extras["labels"])
+    grid_h, grid_w = grid.shape
+    lon_span = (ce - cw) or 1e-9
+    lat_span = (cn - cs) or 1e-9
+
+    # Map the requested box to grid cell indices (lon W->E cols, lat N->S rows).
+    c0 = _clamp_int(int(math.floor((rw - cw) / lon_span * grid_w)), 0, grid_w - 1)
+    c1 = _clamp_int(int(math.ceil((re_ - cw) / lon_span * grid_w)), c0 + 1, grid_w)
+    r0 = _clamp_int(int(math.floor((cn - rn) / lat_span * grid_h)), 0, grid_h - 1)
+    r1 = _clamp_int(int(math.ceil((cn - rs) / lat_span * grid_h)), r0 + 1, grid_h)
+
+    sub = grid[r0:r1, c0:c1]
+    sub_h, sub_w = sub.shape
+
+    # Cell-aligned bounds of the crop (a hair larger than requested — like snapping).
+    west2 = cw + c0 / grid_w * lon_span
+    east2 = cw + c1 / grid_w * lon_span
+    north2 = cn - r0 / grid_h * lat_span
+    south2 = cn - r1 / grid_h * lat_span
+
+    scale = _upscale_factor(sub_w, sub_h)
+    image_b64 = _encode_png(_render_overlay(sub), scale)
+    out_w, out_h = sub_w * scale, sub_h * scale
+
+    # Crop the backdrop from the stored PNG (which spans the full cached bounds).
+    base_b64 = payload.get("baseImagePngBase64")
+    if base_b64:
+        base_img = Image.open(io.BytesIO(base64.b64decode(base_b64))).convert("RGBA")
+        bw, bh = base_img.size
+        bx0 = _clamp_int(int(round((west2 - cw) / lon_span * bw)), 0, bw - 1)
+        bx1 = _clamp_int(int(round((east2 - cw) / lon_span * bw)), bx0 + 1, bw)
+        by0 = _clamp_int(int(round((cn - north2) / lat_span * bh)), 0, bh - 1)
+        by1 = _clamp_int(int(round((cn - south2) / lat_span * bh)), by0 + 1, bh)
+        base_image_b64 = _encode_png(base_img.crop((bx0, by0, bx1, by1)), 1)
+    else:
+        base_image_b64 = None
+
+    area_km2 = _bbox_area_km2(west2, south2, east2, north2)
+    total_cells = sub_h * sub_w
+    classes = []
+    classified = 0
+    for name, (red, green, blue) in LAND_COVER_COLORS.items():
+        count = int((sub == name).sum())
+        classified += count
+        classes.append({
+            "name": name,
+            "color": f"#{red:02X}{green:02X}{blue:02X}",
+            "pixels": count,
+            "percent": round(100.0 * count / total_cells, 2) if total_cells else 0.0,
+            "areaKm2": round(area_km2 * count / total_cells, 4) if total_cells else 0.0,
+        })
+    classes.sort(key=lambda c: c["pixels"], reverse=True)
+
+    return {
+        "status": "success",
+        "message": f"Classified {classified} of {total_cells} cells",
+        "imagePngBase64": image_b64,
+        "baseImagePngBase64": base_image_b64,
+        "imageWidth": out_w,
+        "imageHeight": out_h,
+        "bounds": {"north": north2, "south": south2, "east": east2, "west": west2},
+        "classes": classes,
+        "stats": {
+            "gridWidth": sub_w,
+            "gridHeight": sub_h,
+            "totalCells": total_cells,
+            "classifiedCells": classified,
+            "resolutionMeters": int(extras.get("resM", 30)),
+            "areaKm2": round(area_km2, 4),
+            "date": payload.get("stats", {}).get("date"),
+        },
+        "requestId": payload.get("requestId"),
+        "cached": True,
+        "cachedSubset": True,
+    }
+
+
+def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
+    """Build a change-detection response for ``req_bbox`` from a cached area.
+
+    Change detection returns per-pixel changes with their own lon/lat, so we
+    simply keep the changed pixels inside the sub-box and recompute the counts.
+    ``totalPixels`` (the denominator, not part of the changes list) is scaled by
+    the sub-area's share of the cached area.
+    """
+    payload = contained["payload"]
+    cw, cs, ce, cn = contained["bounds"]
+    rw, rs, re_, rn = req_bbox
+
+    changes = [
+        c for c in payload.get("changes", [])
+        if rw <= c["Longitude"] <= re_ and rs <= c["Latitude"] <= rn
+    ]
+    deforestation = sum(1 for c in changes if c.get("mask") == 1)
+    water_loss = sum(1 for c in changes if c.get("mask") == 2)
+
+    full_stats = payload.get("stats", {})
+    full_total = int(full_stats.get("totalPixels", 0))
+    full_area = _bbox_area_km2(cw, cs, ce, cn)
+    sub_area = _bbox_area_km2(rw, rs, re_, rn)
+    ratio = (sub_area / full_area) if full_area > 0 else 0.0
+
+    stats = dict(full_stats)
+    stats["totalPixels"] = max(int(round(full_total * ratio)), len(changes))
+    stats["deforestation"] = deforestation
+    stats["waterLoss"] = water_loss
+
+    return {
+        "status": "success",
+        "message": f"Analysis complete: {len(changes)} changed pixels detected",
+        "changes": changes,
+        "stats": stats,
+        "requestId": payload.get("requestId"),
+        "cached": True,
+        "cachedSubset": True,
+    }
+
+
 @app.post("/api/sentinel/classify")
 def classify_land_use():
     """Classify one date's composite into land-cover types.
@@ -785,6 +971,29 @@ def classify_land_use():
             return jsonify({"status": "error", "message": "'month' must be 1-12"}), 400
 
         logger.info("[%s] date=%d-%02d  polygon=%d pts", request_id, year, month, len(polygon))
+
+        # Result cache: the whole response is keyed by area + month, so an
+        # identical (or ~100 m-close) re-run skips every Sentinel Hub fetch.
+        lons = [float(pt[0]) for pt in polygon]
+        lats = [float(pt[1]) for pt in polygon]
+        bbox_bounds = (min(lons), min(lats), max(lons), max(lats))
+        date_key = f"{year}-{month:02d}"
+        is_current = (year, month) == (now.year, now.month)
+
+        cached = cache_get("classify", date_key, bbox_bounds, is_current)
+        if cached is not None:
+            logger.info("[%s] served land-use classification from cache", request_id)
+            return jsonify(cached)
+
+        # Phase 2: a smaller area fully inside a computed one is cropped from it.
+        contained = cache_get_containing("classify", date_key, bbox_bounds, is_current)
+        if contained is not None and contained.get("extras"):
+            try:
+                sub_result = _crop_classify(contained, bbox_bounds)
+                logger.info("[%s] served land-use from a cached larger area (subset)", request_id)
+                return jsonify(sub_result)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[%s] subset crop failed (%s); computing fresh", request_id, exc)
 
         cfg = build_config()
         # whole_month=True: composite every pass in the month so the cloud-masked
@@ -867,7 +1076,7 @@ def classify_land_use():
             {c["name"]: c["pixels"] for c in classes},
         )
 
-        return jsonify({
+        result = {
             "status": "success",
             "message": f"Classified {classified} of {total_cells} cells",
             "imagePngBase64": image_b64,
@@ -886,7 +1095,15 @@ def classify_land_use():
                 "date": f"{year}-{month:02d}",
             },
             "requestId": request_id,
-        })
+        }
+        extras = {
+            "labels": _encode_grid(grid),
+            "gridW": width,
+            "gridH": height,
+            "resM": 30 * step,
+        }
+        cache_put("classify", date_key, bbox_bounds, is_current, result, extras=extras)
+        return jsonify(result)
 
     except ValueError as exc:
         logger.exception("[%s] Validation error: %s", request_id, exc)

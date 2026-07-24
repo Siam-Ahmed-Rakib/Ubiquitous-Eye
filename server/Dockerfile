@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server/api_server.py ./
 COPY server/bimonthly_composite.py ./
+COPY server/cache.py ./
 COPY server/inference/ ./inference/
 COPY --from=frontend-builder /app/Frontend/dist /app/frontend_dist
 

@@ -7,6 +7,9 @@ services:
     environment:
       SH_CLIENT_ID: ${SH_CLIENT_ID}
       SH_CLIENT_SECRET: ${SH_CLIENT_SECRET}
+      # Result cache (Supabase Postgres). Empty = cache disabled, endpoints
+      # behave exactly as before. Set in .env; never commit a real value.
+      DATABASE_URL: ${DATABASE_URL:-}
     volumes:
       - ./server/GRANULE:/app/GRANULE
       - ./Frontend/dist:/app/frontend_dist

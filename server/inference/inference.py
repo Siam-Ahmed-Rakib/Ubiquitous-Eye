@@ -5,6 +5,31 @@ import joblib
 from scipy.stats import mode
 
 
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capstone_model_v2")
+_MODEL_NAMES = ["xgboost", "catboost", "lightgbm", "cart"]
+_ARTIFACTS = None
+
+
+def _load_artifacts():
+    """Load the scaler, label encoder, and 4 models once, then reuse them.
+
+    ``ensemble_predict`` runs on every classified tile; re-reading ~6 MB of
+    joblib files from disk on each call was pure overhead. We load lazily on
+    first use so import stays cheap and order-independent.
+    """
+    global _ARTIFACTS
+    if _ARTIFACTS is None:
+        _ARTIFACTS = {
+            "scaler": joblib.load(os.path.join(_MODEL_DIR, "scaler.joblib")),
+            "label_encoder": joblib.load(os.path.join(_MODEL_DIR, "label_encoder.joblib")),
+            "models": [
+                joblib.load(os.path.join(_MODEL_DIR, f"{name}.joblib"))
+                for name in _MODEL_NAMES
+            ],
+        }
+    return _ARTIFACTS
+
+
 def expand_class(df):
     # Vegetation → Tree (NDVI > 0.6) or Crop (NDVI <= 0.6)
     veg_mask = df['ClassID'] == 4
@@ -68,28 +93,22 @@ def ensemble_predict(df: pd.DataFrame) -> pd.DataFrame:
                     "EVI", "NDBI", "MNDWI", "BSI", "NDVI"]
     X = df[feature_cols].values
 
-    # --- Load artifacts ---
-    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capstone_model_v2")
+    # --- Load artifacts (cached across calls) ---
+    artifacts = _load_artifacts()
+    X_scaled = artifacts["scaler"].transform(X)
 
-    scaler = joblib.load(os.path.join(model_dir, "scaler.joblib"))
-    label_encoder = joblib.load(os.path.join(model_dir, "label_encoder.joblib"))
-
-    X_scaled = scaler.transform(X)
-
-    # --- Load models and predict ---
-    model_names = ["xgboost", "catboost", "lightgbm", "cart"]
-    preds_list = []
-    for name in model_names:
-        model = joblib.load(os.path.join(model_dir, f"{name}.joblib"))
-        p = model.predict(X_scaled)
-        preds_list.append(np.asarray(p).flatten())
+    # --- Predict with each model ---
+    preds_list = [
+        np.asarray(model.predict(X_scaled)).flatten()
+        for model in artifacts["models"]
+    ]
     predictions = np.vstack(preds_list)  # shape: (4, n_samples)
 
     # --- Majority vote ---
     ensemble_pred = mode(predictions, axis=0, keepdims=False).mode
 
     # --- Decode back to original ClassID ---
-    df["ClassID"] = label_encoder.inverse_transform(ensemble_pred.astype(int))
+    df["ClassID"] = artifacts["label_encoder"].inverse_transform(ensemble_pred.astype(int))
 
     df = expand_class(df)
 
