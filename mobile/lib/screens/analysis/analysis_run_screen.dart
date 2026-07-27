@@ -6,14 +6,20 @@ import '../../models/analysis_result.dart';
 import '../../models/area_bounds.dart';
 import '../../services/analysis_service.dart';
 import '../../util/responsive.dart';
+import '../../widgets/before_after_compare.dart';
 import '../../widgets/map_gestures.dart';
 import '../../widgets/map_zoom_controls.dart';
 import '../../widgets/month_year_field.dart';
 
 const Color _ink = Color(0xFF0E1116);
 const Color _accent = Color(0xFFEF9A3D);
-const Color _deforestColor = Color(0xFFE53935); // mask 1 — vegetation/forest loss
-const Color _waterColor = Color(0xFFFB8C00); // mask 2 — surface-water loss
+// Defined once in the model, next to the backend's matching CHANGE_COLORS.
+const Color _deforestColor = kDeforestationColor; // mask 1 — vegetation loss
+const Color _waterColor = kWaterLossColor; // mask 2 — surface-water loss
+
+/// How a finished result is presented. Before/after is the default when the
+/// backend returned imagery; the map stays available for geographic context.
+enum _ResultView { compare, map }
 
 /// Runs the backend change-detection pipeline over a selected area and shows
 /// the result: changed pixels drawn on the map (red = deforestation,
@@ -53,6 +59,14 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
   bool _loading = false;
   String? _error;
   AnalysisResult? _result;
+  _ResultView _view = _ResultView.compare;
+
+  /// True when a finished result should be shown as before/after scenes rather
+  /// than as points on the map.
+  bool get _showingCompare =>
+      _result != null &&
+      _result!.hasComparisonImagery &&
+      _view == _ResultView.compare;
 
   @override
   void initState() {
@@ -115,6 +129,7 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
   void _reset() => setState(() {
         _result = null;
         _error = null;
+        _view = _ResultView.compare;
       });
 
   void _zoomBy(double delta) {
@@ -140,11 +155,76 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
           style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 18),
         ),
       ),
-      body: Column(
-        children: [
-          Expanded(child: _buildMap()),
-          _buildPanel(context),
+      body: _showingCompare
+          ? _buildComparePage(context)
+          : Column(
+              children: [
+                Expanded(child: _buildMap()),
+                _buildPanel(context),
+              ],
+            ),
+    );
+  }
+
+  // ── Before/after page ────────────────────────────────────────────────────
+  /// Scrolls as one page: the two scenes, then the same stats the map view
+  /// shows. There is no map here — the imagery *is* the geography.
+  Widget _buildComparePage(BuildContext context) {
+    final result = _result!;
+    return SafeArea(
+      top: false,
+      child: SingleChildScrollView(
+        child: ResponsiveCenter(
+          maxWidth: 1100,
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (result.isSample) ...[
+                _SampleBanner(),
+                const SizedBox(height: 12),
+              ],
+              _buildViewToggle(),
+              const SizedBox(height: 16),
+              BeforeAfterCompare(result: result),
+              const SizedBox(height: 20),
+              const Divider(height: 1),
+              const SizedBox(height: 18),
+              _buildResultsBody(result),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Switches a finished result between the before/after scenes and the map.
+  /// Only shown when the backend actually returned imagery.
+  Widget _buildViewToggle() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: SegmentedButton<_ResultView>(
+        segments: const [
+          ButtonSegment(
+            value: _ResultView.compare,
+            icon: Icon(Icons.compare, size: 17),
+            label: Text('Before / after'),
+          ),
+          ButtonSegment(
+            value: _ResultView.map,
+            icon: Icon(Icons.map_outlined, size: 17),
+            label: Text('Map'),
+          ),
         ],
+        selected: {_view},
+        showSelectedIcon: false,
+        style: SegmentedButton.styleFrom(
+          foregroundColor: Colors.grey.shade700,
+          selectedForegroundColor: Colors.white,
+          selectedBackgroundColor: _ink,
+          textStyle: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+        ),
+        onSelectionChanged: (s) => setState(() => _view = s.first),
       ),
     );
   }
@@ -265,30 +345,36 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
       child: ColoredBox(
         color: Colors.black54,
         child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 44,
-                height: 44,
-                child: CircularProgressIndicator(color: _accent, strokeWidth: 3),
-              ),
-              SizedBox(height: 16),
-              Text(
-                'Running analysis…',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
+          // As in LandUseScreen: the map area is short on a small phone once the
+          // panel takes its half, so this message scrolls instead of clipping.
+          child: SingleChildScrollView(
+            padding: EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 44,
+                  height: 44,
+                  child:
+                      CircularProgressIndicator(color: _accent, strokeWidth: 3),
                 ),
-              ),
-              SizedBox(height: 6),
-              Text(
-                'Fetching Sentinel-2 composites — this can take a\nfew minutes.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-            ],
+                SizedBox(height: 16),
+                Text(
+                  'Running analysis…',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                SizedBox(height: 6),
+                Text(
+                  'Fetching Sentinel-2 composites — this can take a\nfew minutes.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -327,9 +413,14 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
           children: [
             const Icon(Icons.crop_free, size: 18, color: _ink),
             const SizedBox(width: 8),
-            Text(
-              '${widget.bounds.areaKm2.toStringAsFixed(2)} km² selected',
-              style: const TextStyle(fontWeight: FontWeight.w700, color: _ink),
+            // A large selection ("1234.56 km² selected") is wider than a small
+            // phone's panel once text scaling is on; let it wrap rather than
+            // run past the edge.
+            Flexible(
+              child: Text(
+                '${widget.bounds.areaKm2.toStringAsFixed(2)} km² selected',
+                style: const TextStyle(fontWeight: FontWeight.w700, color: _ink),
+              ),
             ),
           ],
         ),
@@ -393,8 +484,9 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
     );
   }
 
+  /// The map view's panel: banner, the shared results body, and — when the
+  /// backend sent imagery — a way over to the before/after scenes.
   Widget _buildResults(AnalysisResult result) {
-    final stats = result.stats;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -402,24 +494,47 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
           _SampleBanner(),
           const SizedBox(height: 12),
         ],
+        if (result.hasComparisonImagery) ...[
+          _buildViewToggle(),
+          const SizedBox(height: 14),
+        ],
+        _buildResultsBody(result),
+      ],
+    );
+  }
+
+  /// Header, stat cards, summary line, and the re-run button — identical in the
+  /// map panel and on the before/after page.
+  Widget _buildResultsBody(AnalysisResult result) {
+    final stats = result.stats;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
         Row(
           children: [
             const Icon(Icons.insights_outlined, size: 20, color: _ink),
             const SizedBox(width: 8),
-            const Expanded(
-              child: Text(
-                'Results',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                  color: _ink,
-                ),
+            const Text(
+              'Results',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+                color: _ink,
               ),
             ),
+            const SizedBox(width: 8),
+            // The title takes only the width it needs and the date range gets
+            // the remainder, ellipsised if the panel is too narrow — as the
+            // opposite arrangement pushed the dates off the right edge.
             if (stats != null)
-              Text(
-                '${stats.oldDate}  →  ${stats.newDate}',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              Expanded(
+                child: Text(
+                  '${stats.oldDate}  →  ${stats.newDate}',
+                  textAlign: TextAlign.end,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                ),
               ),
           ],
         ),
@@ -455,7 +570,7 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
         Text(
           result.hasChanges
               ? 'Detected ${_formatCount(result.changes.length)} changed pixels, '
-                  'shown on the map above.'
+                  '${_showingCompare ? 'marked on both scenes above.' : 'shown on the map above.'}'
               : 'No change detected between the two dates.',
           style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
         ),

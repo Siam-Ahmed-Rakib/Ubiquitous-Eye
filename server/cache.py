@@ -13,6 +13,14 @@ environment variable. In production that is Supabase Postgres; the tests point
 it at a throwaway SQLite file. If ``DATABASE_URL`` is unset or the database is
 unreachable, every operation degrades to a silent no-op, so the endpoints keep
 working exactly as before — the cache can never be the reason a request fails.
+
+Rows are identified by a surrogate ``id`` primary key; the natural key
+(``cache_key``) is kept as a UNIQUE column so lookups are unchanged while
+foreign keys and admin tooling get a stable, opaque row identity. On Postgres
+``payload``/``extras`` are real JSONB columns, so stored responses are queryable
+from SQL instead of being opaque text. An existing table created by an earlier
+version is migrated in place on startup — see ``_migrate_postgres`` /
+``_migrate_sqlite``.
 """
 
 from __future__ import annotations
@@ -36,10 +44,22 @@ CURRENT_PERIOD_TTL_DAYS = 5
 
 _TABLE = "analysis_cache"
 
+# Columns carried over verbatim when an old SQLite table has to be rebuilt.
+_CARRIED_COLUMNS = (
+    "cache_key", "analysis", "date_key",
+    "west", "south", "east", "north",
+    "is_current", "payload", "extras", "created_at",
+)
+
 # Lazily-built SQLAlchemy engine. ``_engine_ready`` records that we already tried
 # (so a failed/absent DB is not retried on every request).
 _engine = None
 _engine_ready = False
+
+# True once we have confirmed ``payload``/``extras`` really are JSONB columns.
+# Writes must then cast the JSON text explicitly (Postgres has no implicit
+# text -> jsonb assignment cast) and reads get back parsed objects, not strings.
+_json_columns = False
 
 
 # ── Key building ──────────────────────────────────────────────────────────────
@@ -80,33 +100,182 @@ def _database_url() -> str | None:
     return url
 
 
-def _init_schema(engine) -> None:
-    from sqlalchemy import text
+def _is_postgres(engine) -> bool:
+    return engine.dialect.name.startswith("postgres")
 
-    # created_at is stored as an ISO-8601 UTC string so we never depend on a
-    # dialect's datetime binding (SQLite in particular). DOUBLE PRECISION carries
-    # the real bbox for a future "sub-area fully inside a computed one" lookup.
-    ddl = f"""
+
+def _create_table_sql(pg: bool) -> str:
+    """DDL for a fresh table.
+
+    ``id`` is the primary key — an opaque surrogate that stays valid even if the
+    natural key ever has to change; ``cache_key`` keeps its uniqueness so the
+    lookups below are unaffected. ``longitude``/``latitude`` are the centre of
+    the analysed box, denormalised so a row can be located on a map (or matched
+    against a user's position) without re-deriving it from the four bounds.
+    created_at is stored as an ISO-8601 UTC string so we never depend on a
+    dialect's datetime binding (SQLite in particular). DOUBLE PRECISION carries
+    the real bbox for the "sub-area fully inside a computed one" lookup.
+    """
+    id_col = "id BIGSERIAL PRIMARY KEY" if pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    json_type = "JSONB" if pg else "TEXT"
+    return f"""
     CREATE TABLE IF NOT EXISTS {_TABLE} (
-        cache_key   TEXT PRIMARY KEY,
+        {id_col},
+        cache_key   TEXT NOT NULL UNIQUE,
         analysis    TEXT NOT NULL,
         date_key    TEXT NOT NULL,
         west        DOUBLE PRECISION NOT NULL,
         south       DOUBLE PRECISION NOT NULL,
         east        DOUBLE PRECISION NOT NULL,
         north       DOUBLE PRECISION NOT NULL,
+        longitude   DOUBLE PRECISION,
+        latitude    DOUBLE PRECISION,
         is_current  INTEGER NOT NULL DEFAULT 0,
-        payload     TEXT NOT NULL,
-        extras      TEXT,
+        payload     {json_type} NOT NULL,
+        extras      {json_type},
         created_at  TEXT NOT NULL
     )
     """
+
+
+def _index_sql() -> str:
+    return (
+        f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_lookup "
+        f"ON {_TABLE} (analysis, date_key)"
+    )
+
+
+def _migrate_postgres(engine) -> None:
+    """Bring an existing Postgres table up to the current schema, in place.
+
+    Every step is conditional on what the table actually looks like, so this is
+    a no-op once migrated and safe to run on every boot. It all happens in one
+    transaction (Postgres DDL is transactional), so a failure part-way leaves
+    the old, working schema untouched.
+    """
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    cols = {c["name"]: c for c in insp.get_columns(_TABLE)}
+    pk = insp.get_pk_constraint(_TABLE) or {}
+    pk_cols = list(pk.get("constrained_columns") or [])
+    uniques = {tuple(u.get("column_names") or []) for u in insp.get_unique_constraints(_TABLE)}
+    uniques |= {
+        tuple(ix.get("column_names") or [])
+        for ix in insp.get_indexes(_TABLE) if ix.get("unique")
+    }
+
+    stmts: list[str] = []
+
+    # Task 3: the analysed centre point.
+    if "longitude" not in cols:
+        stmts.append(f"ALTER TABLE {_TABLE} ADD COLUMN longitude DOUBLE PRECISION")
+    if "latitude" not in cols:
+        stmts.append(f"ALTER TABLE {_TABLE} ADD COLUMN latitude DOUBLE PRECISION")
+
+    # Task 2: text -> jsonb. Everything ever written here came from json.dumps,
+    # so the USING cast cannot see malformed input.
+    for name in ("payload", "extras"):
+        col = cols.get(name)
+        if col is not None and "JSON" not in str(col["type"]).upper():
+            stmts.append(
+                f"ALTER TABLE {_TABLE} ALTER COLUMN {name} TYPE JSONB USING {name}::jsonb"
+            )
+
+    # Task 1: surrogate id becomes the primary key, cache_key stays unique.
+    if "id" not in cols:
+        stmts.append(f"ALTER TABLE {_TABLE} ADD COLUMN id BIGSERIAL")
+    if pk_cols != ["id"]:
+        if ("cache_key",) not in uniques:
+            stmts.append(
+                f"ALTER TABLE {_TABLE} "
+                f"ADD CONSTRAINT {_TABLE}_cache_key_key UNIQUE (cache_key)"
+            )
+        if pk_cols:
+            # Drop before add: a table can only carry one primary key.
+            stmts.append(f'ALTER TABLE {_TABLE} DROP CONSTRAINT "{pk["name"]}"')
+        stmts.append(f"ALTER TABLE {_TABLE} ADD CONSTRAINT {_TABLE}_pkey PRIMARY KEY (id)")
+
+    if not stmts:
+        return
+
+    # Backfill the centre for rows written before those columns existed.
+    stmts.append(
+        f"UPDATE {_TABLE} SET longitude = (west + east) / 2.0, "
+        f"latitude = (south + north) / 2.0 "
+        f"WHERE longitude IS NULL OR latitude IS NULL"
+    )
+
     with engine.begin() as conn:
-        conn.execute(text(ddl))
+        for stmt in stmts:
+            conn.execute(text(stmt))
+    logger.info("Result cache schema migrated (%d statement(s))", len(stmts))
+
+
+def _migrate_sqlite(engine) -> None:
+    """Bring an existing SQLite table up to the current schema.
+
+    SQLite cannot ALTER a primary key, so the table is rebuilt and the rows
+    copied across. Cheap here — SQLite is only ever the test/local backend.
+    """
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    cols = [c["name"] for c in insp.get_columns(_TABLE)]
+    pk_cols = list((insp.get_pk_constraint(_TABLE) or {}).get("constrained_columns") or [])
+    if pk_cols == ["id"] and "longitude" in cols and "latitude" in cols:
+        return
+
+    carried = [c for c in _CARRIED_COLUMNS if c in cols]
+    lon = "longitude" if "longitude" in cols else "(west + east) / 2.0"
+    lat = "latitude" if "latitude" in cols else "(south + north) / 2.0"
+    old = f"{_TABLE}_old"
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {old}"))
+        conn.execute(text(f"ALTER TABLE {_TABLE} RENAME TO {old}"))
+        conn.execute(text(_create_table_sql(pg=False)))
         conn.execute(text(
-            f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_lookup "
-            f"ON {_TABLE} (analysis, date_key)"
+            f"INSERT INTO {_TABLE} ({', '.join(carried)}, longitude, latitude) "
+            f"SELECT {', '.join(carried)}, {lon}, {lat} FROM {old}"
         ))
+        # Drops the old table's indexes too, freeing the shared index name.
+        conn.execute(text(f"DROP TABLE {old}"))
+    logger.info("Result cache schema rebuilt (SQLite)")
+
+
+def _init_schema(engine) -> None:
+    """Create the table, or migrate an older one, then record the column types."""
+    global _json_columns
+    from sqlalchemy import inspect, text
+
+    pg = _is_postgres(engine)
+    if inspect(engine).has_table(_TABLE):
+        # A migration that cannot run must not take the cache down with it: the
+        # old schema still serves reads and writes, so log and carry on.
+        try:
+            if pg:
+                _migrate_postgres(engine)
+            elif engine.dialect.name == "sqlite":
+                _migrate_sqlite(engine)
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            logger.warning("Result cache schema migration failed (%s) — using existing schema", exc)
+    else:
+        with engine.begin() as conn:
+            conn.execute(text(_create_table_sql(pg)))
+
+    with engine.begin() as conn:
+        conn.execute(text(_index_sql()))
+
+    # Whether writes need an explicit JSONB cast is read back from the database
+    # rather than assumed, so a migration that could not run still leaves a
+    # working (text-column) cache instead of failing every insert.
+    payload_type = next(
+        (str(c["type"]).upper() for c in inspect(engine).get_columns(_TABLE)
+         if c["name"] == "payload"),
+        "",
+    )
+    _json_columns = "JSON" in payload_type
 
 
 def _get_engine():
@@ -137,7 +306,7 @@ def _get_engine():
 
 def reset() -> None:
     """Test hook: drop the memoised engine so the next call rebuilds from env."""
-    global _engine, _engine_ready
+    global _engine, _engine_ready, _json_columns
     if _engine is not None:
         try:
             _engine.dispose()
@@ -145,6 +314,28 @@ def reset() -> None:
             pass
     _engine = None
     _engine_ready = False
+    _json_columns = False
+
+
+# ── JSON column helpers ───────────────────────────────────────────────────────
+
+def _json_load(value):
+    """Decode a stored payload/extras value.
+
+    A JSONB column comes back from psycopg2 already parsed into Python objects,
+    while a TEXT column (SQLite, or a pre-migration table) comes back as a
+    string — accept either so both schemas read identically.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return value
+
+
+def _json_param(name: str) -> str:
+    """Bind-parameter expression for a JSON column."""
+    return f"CAST(:{name} AS JSONB)" if _json_columns else f":{name}"
 
 
 # ── Freshness ─────────────────────────────────────────────────────────────────
@@ -186,13 +377,13 @@ def cache_get(analysis: str, date_key: str, bbox, is_current: bool):
 
         if row is None:
             return None
-        payload_text, created_at = row[0], row[1]
+        payload_value, created_at = row[0], row[1]
 
         if is_current and _is_stale(created_at):
             logger.info("Cache STALE (current period): %s", key)
             return None
 
-        data = json.loads(payload_text)
+        data = _json_load(payload_value)
         data["cached"] = True
         data["cachedAt"] = str(created_at)
         logger.info("Cache HIT: %s", key)
@@ -214,9 +405,10 @@ def cache_put(
 
     The bbox columns hold the *actual* (unquantised) bounds so a later smaller
     request can be tested for containment precisely; only the cache_key uses the
-    quantised bbox. ``extras`` is optional per-analysis data needed to serve a
-    sub-area from this entry (e.g. the land-cover label grid) — never sent to the
-    client, only used to crop.
+    quantised bbox. ``longitude``/``latitude`` are the centre of that box.
+    ``extras`` is optional per-analysis data needed to serve a sub-area from this
+    entry (e.g. the land-cover label grid) — never sent to the client, only used
+    to crop.
     """
     engine = _get_engine()
     if engine is None:
@@ -224,6 +416,7 @@ def cache_put(
 
     key = make_key(analysis, date_key, bbox)
     w, s, e, n = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    lon, lat = (w + e) / 2.0, (s + n) / 2.0
     try:
         body = json.dumps(payload, separators=(",", ":"))
         extras_body = json.dumps(extras, separators=(",", ":")) if extras is not None else None
@@ -242,12 +435,14 @@ def cache_put(
                 text(
                     f"INSERT INTO {_TABLE} "
                     f"(cache_key, analysis, date_key, west, south, east, north, "
-                    f" is_current, payload, extras, created_at) "
-                    f"VALUES (:k, :a, :d, :w, :s, :e, :n, :cur, :p, :x, :ts)"
+                    f" longitude, latitude, is_current, payload, extras, created_at) "
+                    f"VALUES (:k, :a, :d, :w, :s, :e, :n, :lon, :lat, :cur, "
+                    f"{_json_param('p')}, {_json_param('x')}, :ts)"
                 ),
                 {
                     "k": key, "a": analysis, "d": date_key,
                     "w": w, "s": s, "e": e, "n": n,
+                    "lon": lon, "lat": lat,
                     "cur": 1 if is_current else 0,
                     "p": body, "x": extras_body,
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -291,7 +486,7 @@ def cache_get_containing(analysis: str, date_key: str, req_bbox, is_current: boo
 
         if row is None:
             return None
-        payload_text, extras_text, w, s, e, n, created_at = row
+        payload_value, extras_value, w, s, e, n, created_at = row
 
         if is_current and _is_stale(created_at):
             logger.info("Containing entry STALE (current period) for %s/%s", analysis, date_key)
@@ -299,8 +494,8 @@ def cache_get_containing(analysis: str, date_key: str, req_bbox, is_current: boo
 
         logger.info("Cache CONTAINING hit for %s/%s", analysis, date_key)
         return {
-            "payload": json.loads(payload_text),
-            "extras": json.loads(extras_text) if extras_text else None,
+            "payload": _json_load(payload_value),
+            "extras": _json_load(extras_value) if extras_value else None,
             "bounds": (float(w), float(s), float(e), float(n)),
         }
     except Exception as exc:  # pragma: no cover - depends on external DB

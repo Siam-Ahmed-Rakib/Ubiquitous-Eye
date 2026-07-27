@@ -20,8 +20,15 @@ class CategoryFilterBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const filters = AnalyticsFilter.values;
+    // The chip has to fit the longest label ("Environmental") on one line at the
+    // user's text scale; at a fixed width it broke mid-word into "Environmenta"
+    // + "l". Height follows for the same reason.
+    final scaler = MediaQuery.textScalerOf(context);
+    final chipWidth = scaler.scale(12) * 8.0;
+    final barHeight = 30 + 7 + scaler.scale(12) * 1.1 * 2 + 16;
+
     return SizedBox(
-      height: 86,
+      height: barHeight,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -37,7 +44,7 @@ class CategoryFilterBar extends StatelessWidget {
             onTap: () => onSelected(active ? null : filter),
             borderRadius: BorderRadius.circular(12),
             child: SizedBox(
-              width: 78,
+              width: chipWidth,
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [

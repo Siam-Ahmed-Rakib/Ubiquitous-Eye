@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
@@ -115,7 +116,37 @@ class AnalysisService {
       message: body['message']?.toString() ?? 'Analysis complete',
       changes: changes,
       stats: stats,
+      oldImagePng: _decodePng(body['oldImagePngBase64']),
+      newImagePng: _decodePng(body['newImagePngBase64']),
+      deforestationPng: _decodePng(body['deforestationPngBase64']),
+      waterLossPng: _decodePng(body['waterLossPngBase64']),
+      imageWidth: (body['imageWidth'] as num?)?.toInt() ?? 0,
+      imageHeight: (body['imageHeight'] as num?)?.toInt() ?? 0,
+      imageBounds: _parseBounds(body['bounds']) ?? bounds,
     );
+  }
+
+  /// Decodes an optional base64 raster, tolerating a malformed one rather than
+  /// failing a whole analysis over display-only imagery.
+  static Uint8List? _decodePng(dynamic value) {
+    if (value is! String || value.isEmpty) return null;
+    try {
+      return base64Decode(value);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static AreaBounds? _parseBounds(dynamic value) {
+    if (value is! Map) return null;
+    final north = (value['north'] as num?)?.toDouble();
+    final south = (value['south'] as num?)?.toDouble();
+    final east = (value['east'] as num?)?.toDouble();
+    final west = (value['west'] as num?)?.toDouble();
+    if (north == null || south == null || east == null || west == null) {
+      return null;
+    }
+    return AreaBounds(north: north, south: south, east: east, west: west);
   }
 
   void dispose() => _client.close();

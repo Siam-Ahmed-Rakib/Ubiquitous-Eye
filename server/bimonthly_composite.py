@@ -309,14 +309,20 @@ def fetch_true_color_base(
     client_secret: str,
     target_resolution: int = 10,
     max_px: int = 1536,
+    whole_month: bool = True,
 ):
     """Fetch a sharp, cloud-free Sentinel-2 true-colour scene for the AOI bbox.
 
     This is display-only: the classification still runs on the 30 m composite the
     models were trained on. Here we pull the RGB bands at their native 10 m and
-    let Sentinel Hub mosaic the whole month, masking clouds per pixel via SCL
+    let Sentinel Hub mosaic the window, masking clouds per pixel via SCL
     (see EVALSCRIPT_TRUE_COLOR), so the backdrop under the mask is crisp and
     cloud-free rather than a blown-up 30 m composite.
+
+    ``whole_month`` must match the ``run_composite_pipeline`` call this scene
+    illustrates, or the picture shows a different period than the analysis read:
+    land-use classification composites the whole month, change detection only
+    days 1-15.
 
     Returns ``(rgb, valid)`` where ``rgb`` is H×W×3 float32 in [B04, B03, B02]
     order and ``valid`` is an H×W bool mask (False = cloud / no clear pixel).
@@ -326,8 +332,8 @@ def fetch_true_color_base(
     bbox = BBox((min(lons), min(lats), max(lons), max(lats)), crs=CRS.WGS84)
     size = _true_color_size(bbox, target_resolution, max_px)
 
-    start = date(year, month, 1)
-    end = date(year, month, calendar.monthrange(year, month)[1])
+    start, end = month_range(year, month) if whole_month else determine_half(year, month)
+    logger.info("True-colour window: %s -> %s (whole_month=%s)", start, end, whole_month)
     cfg = build_s2_config(client_id, client_secret)
 
     req = SentinelHubRequest(

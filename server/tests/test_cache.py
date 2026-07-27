@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -88,6 +88,113 @@ def test_current_period_result_goes_stale(sqlite_cache):
     # past-month request still hits, because past months never change.
     assert cache.cache_get("classify", "2026-07", bbox, is_current=True) is None
     assert cache.cache_get("classify", "2026-07", bbox, is_current=False) is not None
+
+
+def test_row_has_surrogate_id_primary_key(sqlite_cache):
+    """id is the primary key; cache_key stays unique so lookups are unaffected."""
+    bbox = (90.0, 23.7, 90.1, 23.8)
+    cache.cache_put("classify", "2024-03", bbox, False, {"v": 1})
+    cache.cache_put("classify", "2024-04", bbox, False, {"v": 2})
+
+    engine = cache._get_engine()
+    pk = inspect(engine).get_pk_constraint(cache._TABLE)["constrained_columns"]
+    assert pk == ["id"]
+
+    # An inline UNIQUE surfaces as a constraint on SQLite and as a unique index
+    # on Postgres, so accept either.
+    insp = inspect(engine)
+    uniques = {tuple(u["column_names"]) for u in insp.get_unique_constraints(cache._TABLE)}
+    uniques |= {tuple(ix["column_names"]) for ix in insp.get_indexes(cache._TABLE) if ix["unique"]}
+    assert ("cache_key",) in uniques
+
+    with engine.connect() as conn:
+        ids = [r[0] for r in conn.execute(text(f"SELECT id FROM {cache._TABLE} ORDER BY id"))]
+    assert len(ids) == 2 and len(set(ids)) == 2, "each row gets its own id"
+
+    # Overwriting an entry keeps the row count at one per cache_key.
+    cache.cache_put("classify", "2024-03", bbox, False, {"v": 3})
+    with engine.connect() as conn:
+        n = conn.execute(text(f"SELECT COUNT(*) FROM {cache._TABLE}")).scalar()
+    assert n == 2
+
+
+def test_centre_longitude_latitude_are_stored(sqlite_cache):
+    cache.cache_put("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), False, {"v": 1})
+
+    with cache._get_engine().connect() as conn:
+        lon, lat = conn.execute(
+            text(f"SELECT longitude, latitude FROM {cache._TABLE}")
+        ).fetchone()
+
+    assert lon == pytest.approx(90.1)
+    assert lat == pytest.approx(23.8)
+
+
+def test_old_schema_is_migrated_in_place(tmp_path, monkeypatch):
+    """A table written by the previous version keeps its rows and gains the new shape."""
+    from sqlalchemy import create_engine
+
+    db_path = tmp_path / "legacy.db"
+    url = f"sqlite:///{db_path}"
+
+    # Build the pre-migration table by hand and seed one row.
+    legacy = create_engine(url, future=True)
+    with legacy.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE {cache._TABLE} (
+                cache_key   TEXT PRIMARY KEY,
+                analysis    TEXT NOT NULL,
+                date_key    TEXT NOT NULL,
+                west        DOUBLE PRECISION NOT NULL,
+                south       DOUBLE PRECISION NOT NULL,
+                east        DOUBLE PRECISION NOT NULL,
+                north       DOUBLE PRECISION NOT NULL,
+                is_current  INTEGER NOT NULL DEFAULT 0,
+                payload     TEXT NOT NULL,
+                extras      TEXT,
+                created_at  TEXT NOT NULL
+            )
+        """))
+        conn.execute(text(
+            f"CREATE INDEX idx_{cache._TABLE}_lookup ON {cache._TABLE} (analysis, date_key)"
+        ))
+        conn.execute(
+            text(f"INSERT INTO {cache._TABLE} (cache_key, analysis, date_key, west, south, "
+                 f"east, north, is_current, payload, extras, created_at) "
+                 f"VALUES (:k, 'classify', '2024-03', 90.0, 23.7, 90.2, 23.9, 0, :p, NULL, :ts)"),
+            {
+                "k": cache.make_key("classify", "2024-03", (90.0, 23.7, 90.2, 23.9)),
+                "p": '{"status":"success","value":7}',
+                "ts": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    legacy.dispose()
+
+    monkeypatch.setenv("DATABASE_URL", url)
+    cache.reset()
+    try:
+        # Opening the cache migrates the table.
+        got = cache.cache_get("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), is_current=False)
+        assert got is not None and got["value"] == 7, "existing rows survive the migration"
+
+        engine = cache._get_engine()
+        insp = inspect(engine)
+        assert insp.get_pk_constraint(cache._TABLE)["constrained_columns"] == ["id"]
+        cols = {c["name"] for c in insp.get_columns(cache._TABLE)}
+        assert {"id", "longitude", "latitude"} <= cols
+
+        # The legacy row is backfilled with its centre point.
+        with engine.connect() as conn:
+            lon, lat = conn.execute(
+                text(f"SELECT longitude, latitude FROM {cache._TABLE}")
+            ).fetchone()
+        assert lon == pytest.approx(90.1) and lat == pytest.approx(23.8)
+
+        # And the migrated table still accepts writes.
+        cache.cache_put("classify", "2024-05", (90.0, 23.7, 90.2, 23.9), False, {"v": 9})
+        assert cache.cache_get("classify", "2024-05", (90.0, 23.7, 90.2, 23.9), False)["v"] == 9
+    finally:
+        cache.reset()
 
 
 def test_disabled_cache_is_a_noop(monkeypatch):

@@ -22,29 +22,38 @@ class UbiquitousEyesLogo extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CustomPaint(
-              size: Size(eyeSize, eyeSize),
-              painter: const _IrisEyePainter(),
-            ),
-            SizedBox(width: 11 * scale),
-            RichText(
-              text: TextSpan(
+        // The wordmark is a single unbreakable line, so on a 320 px phone it is
+        // wider than the screen. FittedBox shrinks it to fit instead of letting
+        // it run off the edge; on roomier screens it is a no-op.
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CustomPaint(
+                size: Size(eyeSize, eyeSize),
+                painter: const _IrisEyePainter(),
+              ),
+              SizedBox(width: 11 * scale),
+              Text.rich(
+                const TextSpan(
+                  children: [
+                    TextSpan(text: 'UBIQUITOUS '),
+                    TextSpan(text: 'EYES', style: TextStyle(color: _accent)),
+                  ],
+                ),
+                maxLines: 1,
+                // Text.rich (unlike RichText) honours the platform text scale,
+                // so the wordmark grows with the user's font-size setting.
                 style: TextStyle(
                   fontSize: 21 * scale,
                   fontWeight: FontWeight.w800,
                   letterSpacing: 2.0 * scale,
                   color: _ink,
                 ),
-                children: const [
-                  TextSpan(text: 'UBIQUITOUS '),
-                  TextSpan(text: 'EYES', style: TextStyle(color: _accent)),
-                ],
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         if (showAnalyticsLabel) ...[
           SizedBox(height: 7 * scale),

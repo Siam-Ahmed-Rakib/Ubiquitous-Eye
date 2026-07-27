@@ -67,41 +67,59 @@ class _AnalyticsPageState extends State<AnalyticsPage> {
                       borderRadius:
                           BorderRadius.vertical(top: Radius.circular(18)),
                     ),
-                    child: items.isEmpty
-                        ? _emptyState()
-                        : Center(
-                            child: ConstrainedBox(
-                              // Cap the grid width so cards don't stretch on
-                              // very wide desktop windows.
-                              constraints: const BoxConstraints(maxWidth: 1180),
-                              child: GridView.builder(
-                                padding:
-                                    const EdgeInsets.fromLTRB(16, 18, 16, 16),
-                                gridDelegate:
-                                    SliverGridDelegateWithFixedCrossAxisCount(
-                                  // 2 columns on phones, more as width grows.
-                                  crossAxisCount: context.responsive(
-                                    phone: 2,
-                                    tablet: 3,
-                                    desktop: 4,
-                                  ),
-                                  mainAxisSpacing: 14,
-                                  crossAxisSpacing: 14,
-                                  childAspectRatio: 0.70,
-                                ),
-                                itemCount: items.length,
-                                itemBuilder: (context, i) => ServiceCard(
-                                  service: items[i],
-                                  onTap: () => _openService(items[i]),
-                                ),
-                              ),
-                            ),
-                          ),
+                    child: items.isEmpty ? _emptyState() : _grid(items),
                   );
                 },
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// The catalog grid.
+  ///
+  /// Tile *height* is computed rather than expressed as a fixed
+  /// `childAspectRatio`: a card is a thumbnail of fixed aspect stacked on a text
+  /// block whose height depends on the user's text scale. A constant ratio makes
+  /// the card too short as soon as text is scaled up, which is what used to push
+  /// the heart button past the bottom edge.
+  Widget _grid(List<AnalyticsService> items) {
+    const double gap = 14;
+    const EdgeInsets pad = EdgeInsets.fromLTRB(16, 18, 16, 16);
+
+    return Center(
+      child: ConstrainedBox(
+        // Cap the grid width so cards don't stretch on very wide desktop windows.
+        constraints: const BoxConstraints(maxWidth: 1180),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = context.responsive(phone: 2, tablet: 3, desktop: 4);
+            final cardWidth =
+                (constraints.maxWidth - pad.horizontal - gap * (columns - 1)) /
+                    columns;
+
+            final scaler = MediaQuery.textScalerOf(context);
+            // Mirrors ServiceCard's own layout, so the two stay in step.
+            final tileHeight = cardWidth / kServiceCardThumbAspect +
+                kServiceCardTextBlockHeight(scaler);
+
+            return GridView.builder(
+              padding: pad,
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: columns,
+                mainAxisSpacing: gap,
+                crossAxisSpacing: gap,
+                mainAxisExtent: tileHeight,
+              ),
+              itemCount: items.length,
+              itemBuilder: (context, i) => ServiceCard(
+                service: items[i],
+                onTap: () => _openService(items[i]),
+              ),
+            );
+          },
         ),
       ),
     );

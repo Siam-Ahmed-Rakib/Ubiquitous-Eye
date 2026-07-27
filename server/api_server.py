@@ -19,6 +19,7 @@ import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from PIL import Image
+from scipy.ndimage import binary_dilation
 from sentinelhub import (
     BBox,
     CRS,
@@ -30,7 +31,12 @@ from sentinelhub import (
     bbox_to_dimensions,
 )
 
-from bimonthly_composite import fetch_true_color_base, run_composite_pipeline
+from bimonthly_composite import (
+    determine_half,
+    fetch_true_color_base,
+    month_range,
+    run_composite_pipeline,
+)
 from cache import cache_get, cache_get_containing, cache_put
 from inference.inference import ensemble_predict, expand_class, get_mask
 
@@ -86,6 +92,42 @@ MAX_OVERLAY_PX = 1536
 TRUE_COLOR_BANDS = ("B04", "B03", "B02")  # red, green, blue
 TRUE_COLOR_PERCENTILES = (2.0, 98.0)
 TRUE_COLOR_GAMMA = 0.8  # < 1 lifts midtones; brightens the cloud-free composite
+
+# Before/after uses a different stretch to the land-use backdrop, over the
+# *combined* reflectance of both dates and all three bands — see
+# `_render_compare_true_color` for why per-band, per-image is wrong here.
+TRUE_COLOR_COMPARE_PERCENTILES = (1.0, 98.0)
+
+# Cap on how many reflectance values the shared stretch is measured from. Two
+# 1536² scenes × 3 bands is ~14 M values; a strided sample of them lands on the
+# same percentiles for a fraction of the memory.
+STRETCH_SAMPLE_LIMIT = 400_000
+
+# Change-mask overlay colours, matching `_deforestColor` / `_waterColor` in
+# mobile/lib/screens/analysis/analysis_run_screen.dart. Keyed by the `mask`
+# value `get_mask` emits.
+CHANGE_COLORS: dict[int, tuple[int, int, int]] = {
+    1: (229, 57, 53),   # forest / vegetation loss  #E53935
+    2: (251, 140, 0),   # surface-water loss        #FB8C00
+}
+
+# A changed pixel is one 10 m cell, which lands on ~1 px of a 1500 px-wide
+# render — effectively invisible. The overlay grows each hit by this many
+# pixels purely so it can be seen; the reported counts are never dilated.
+CHANGE_DILATION_DIVISOR = 500
+
+# Used only when the true-colour fetch fails and there is no base image whose
+# shape the mask can borrow.
+CHANGE_RASTER_PX = 768
+
+# Part of the cache key. Entries written before before/after imagery existed
+# carry no rasters, and serving one would silently drop the comparison view, so
+# the suffix retires them. v3 retired v2, whose scenes were mosaicked over the
+# whole month while the analysis reads only days 1-15 — the picture showed a
+# different period than the numbers. v4 retires v3, whose two scenes were each
+# stretched independently, so the same ground took a different colour on each
+# side. Bump again whenever the response shape or the rendering changes.
+ANALYZE_CACHE_KIND = "analyze_v4"
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -519,13 +561,13 @@ def analyze_change():
             or (new_year, new_month) == (now.year, now.month)
         )
 
-        cached = cache_get("analyze", date_key, bbox_bounds, is_current)
+        cached = cache_get(ANALYZE_CACHE_KIND, date_key, bbox_bounds, is_current)
         if cached is not None:
             logger.info("[%s] served change detection from cache", request_id)
             return jsonify(cached)
 
         # Phase 2: a smaller area fully inside a computed one is cropped from it.
-        contained = cache_get_containing("analyze", date_key, bbox_bounds, is_current)
+        contained = cache_get_containing(ANALYZE_CACHE_KIND, date_key, bbox_bounds, is_current)
         if contained is not None:
             try:
                 sub_result = _crop_analyze(contained, bbox_bounds)
@@ -617,20 +659,64 @@ def analyze_change():
 
         changes = changed[["Longitude", "Latitude", "mask"]].to_dict(orient="records")
 
+        west, east = bbox_bounds[0], bbox_bounds[2]
+        south, north = bbox_bounds[1], bbox_bounds[3]
+
+        # ── Before/after imagery ──
+        # A cloud-masked true-colour scene per date, rendered through one shared
+        # stretch so the pair is comparable, covering the same days the
+        # composites above read. Display-only: failure here must not lose an
+        # otherwise-good analysis, so the client falls back to map points.
+        old_image_b64 = new_image_b64 = None
+        base_w = base_h = 0
+        try:
+            old_image_b64, new_image_b64, base_w, base_h = _before_after_pngs(
+                polygon, old_year, old_month, new_year, new_month,
+                client_id, client_secret,
+            )
+            logger.info("[%s] before/after imagery: %dx%d", request_id, base_w, base_h)
+        except Exception as exc:  # pragma: no cover - network/credentials dependent
+            logger.warning(
+                "[%s] before/after imagery unavailable (%s); returning points only",
+                request_id, exc,
+            )
+            old_image_b64 = new_image_b64 = None
+
+        if base_w < 1 or base_h < 1:
+            base_h, base_w = _change_raster_shape(west, south, east, north)
+
+        deforestation_png_b64 = _encode_png(
+            _render_change_overlay(changed, 1, west, south, east, north, base_h, base_w), 1,
+        )
+        water_loss_png_b64 = _encode_png(
+            _render_change_overlay(changed, 2, west, south, east, north, base_h, base_w), 1,
+        )
+
         result = {
             "status": "success",
             "message": f"Analysis complete: {len(changed)} changed pixels detected",
             "changes": changes,
+            "oldImagePngBase64": old_image_b64,
+            "newImagePngBase64": new_image_b64,
+            "deforestationPngBase64": deforestation_png_b64,
+            "waterLossPngBase64": water_loss_png_b64,
+            "imageWidth": base_w,
+            "imageHeight": base_h,
+            "bounds": {"north": north, "south": south, "east": east, "west": west},
             "stats": {
                 "totalPixels": len(merged),
                 "deforestation": int((changed["mask"] == 1).sum()),
                 "waterLoss": int((changed["mask"] == 2).sum()),
                 "oldDate": f"{old_year}-{old_month:02d}",
                 "newDate": f"{new_year}-{new_month:02d}",
+                # The days each composite actually covers — narrower than the
+                # month the picker implies.
+                "oldWindow": _window_label(old_year, old_month),
+                "newWindow": _window_label(new_year, new_month),
             },
             "requestId": request_id,
         }
-        cache_put("analyze", date_key, bbox_bounds, is_current, result)
+        cache_put(ANALYZE_CACHE_KIND, date_key, bbox_bounds, is_current, result)
         return jsonify(result)
 
     except ValueError as exc:
@@ -777,6 +863,179 @@ def _render_true_color(sub: pd.DataFrame, height: int, width: int) -> Image.Imag
     return _stretch_true_color(bands, valid)
 
 
+def _window_label(year: int, month: int, whole_month: bool = False) -> str:
+    """Human label for the days a composite actually covers, e.g. "1–15 Jan 2025".
+
+    A month picker implies the whole month, but change detection only composites
+    the first half of it. Saying so on screen stops the imagery looking like it
+    is off-date when it is simply a narrower window than the label suggested.
+    """
+    start, end = month_range(year, month) if whole_month else determine_half(year, month)
+    return f"{start.day}–{end.day} {start.strftime('%b')} {start.year}"
+
+
+def _change_raster_shape(west: float, south: float, east: float, north: float) -> tuple[int, int]:
+    """Fallback (height, width) for the change raster, from the bbox aspect.
+
+    Only used when no base image was fetched; otherwise the mask borrows the
+    base image's exact shape so the two register pixel for pixel.
+    """
+    lon_span = abs(east - west) or 1e-9
+    lat_span = abs(north - south) or 1e-9
+    if lon_span >= lat_span:
+        width = CHANGE_RASTER_PX
+        height = max(1, int(round(CHANGE_RASTER_PX * lat_span / lon_span)))
+    else:
+        height = CHANGE_RASTER_PX
+        width = max(1, int(round(CHANGE_RASTER_PX * lon_span / lat_span)))
+    return height, width
+
+
+def _render_change_overlay(
+    changed: pd.DataFrame,
+    mask_value: int,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    height: int,
+    width: int,
+) -> Image.Image:
+    """Paint one change class into an RGBA raster spanning the AOI bounding box.
+
+    Each class gets its own raster so the client can toggle them independently —
+    isolating deforestation is the common case. Sparse transparent PNGs compress
+    to almost nothing, so two rasters cost far less than the imagery does.
+
+    A pixel's lon/lat maps linearly into the box, which is how the client
+    stretches the imagery too, so mask and scene stay aligned. Hits are dilated
+    for visibility only — see CHANGE_DILATION_DIVISOR.
+    """
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    if len(changed) == 0 or width < 1 or height < 1:
+        return Image.fromarray(rgba, mode="RGBA")
+
+    selected = changed[changed["mask"] == mask_value]
+    if len(selected) == 0:
+        return Image.fromarray(rgba, mode="RGBA")
+
+    lon_span = (east - west) or 1e-9
+    lat_span = (north - south) or 1e-9
+    lon = selected["Longitude"].to_numpy(dtype=np.float64)
+    lat = selected["Latitude"].to_numpy(dtype=np.float64)
+
+    cols = np.clip(((lon - west) / lon_span * width).astype(int), 0, width - 1)
+    rows = np.clip(((north - lat) / lat_span * height).astype(int), 0, height - 1)
+
+    hit = np.zeros((height, width), dtype=bool)
+    hit[rows, cols] = True
+    hit = binary_dilation(
+        hit, iterations=max(1, max(height, width) // CHANGE_DILATION_DIVISOR),
+    )
+    rgba[hit] = (*CHANGE_COLORS[mask_value], 255)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _joint_stretch_bounds(scenes: list[tuple[np.ndarray, np.ndarray]]) -> tuple[float, float]:
+    """One (low, high) reflectance range shared by every band of every scene."""
+    pool = []
+    for rgb, valid in scenes:
+        arr = np.asarray(rgb, dtype=np.float64)
+        ok = np.asarray(valid, dtype=bool)
+        if not ok.any():
+            continue
+        for channel in range(arr.shape[-1]):
+            band = arr[..., channel]
+            values = band[ok & np.isfinite(band)]
+            if values.size:
+                pool.append(values)
+    if not pool:
+        return 0.0, 1.0
+
+    combined = np.concatenate(pool)
+    if combined.size > STRETCH_SAMPLE_LIMIT:
+        combined = combined[:: math.ceil(combined.size / STRETCH_SAMPLE_LIMIT)]
+
+    low, high = np.percentile(combined, TRUE_COLOR_COMPARE_PERCENTILES)
+    if high <= low:
+        high = low + 1e-6
+    return float(low), float(high)
+
+
+def _render_compare_true_color(
+    rgb: np.ndarray, valid: np.ndarray, low: float, high: float,
+) -> Image.Image:
+    """Render a scene through a stretch shared with the date it is compared to.
+
+    The land-use backdrop stretches each band to its own 2-98% range, per image.
+    That is wrong for a before/after pair, twice over:
+
+    * Per *image* means each date gets its own mapping, so identical ground
+      renders as different colours across the two panes and a normalisation
+      artefact reads as change.
+    * Per *band* forces red, green and blue to each fill the range, which
+      neutralises the real colour balance — vegetation over-saturates and water
+      crushes to black. That is what makes the output look artificial.
+
+    Applying one range to every band of both scenes keeps the colour relationships
+    the sensor actually recorded, and makes the pair genuinely comparable.
+    """
+    arr = np.asarray(rgb, dtype=np.float64)
+    ok = np.asarray(valid, dtype=bool)
+    height, width = ok.shape
+    out = np.zeros((height, width, 4), dtype=np.uint8)
+
+    span = (high - low) or 1e-6
+    finite = np.ones((height, width), dtype=bool)
+    for channel in range(3):
+        finite &= np.isfinite(arr[..., channel])
+    ok = ok & finite
+
+    for channel in range(3):
+        stretched = np.clip((arr[..., channel] - low) / span, 0.0, 1.0)
+        stretched = np.where(ok, stretched, 0.0) ** TRUE_COLOR_GAMMA
+        out[..., channel] = (stretched * 255.0).astype(np.uint8)
+    out[..., 3] = np.where(ok, 255, 0).astype(np.uint8)
+    return Image.fromarray(out, mode="RGBA")
+
+
+def _before_after_pngs(
+    polygon: list,
+    old_year: int,
+    old_month: int,
+    new_year: int,
+    new_month: int,
+    client_id: str,
+    client_secret: str,
+) -> tuple[str, str, int, int]:
+    """Fetch both dates' scenes and render them through one shared stretch.
+
+    ``whole_month=False`` matches the composites change detection reads (days
+    1-15), so the picture covers the period the numbers came from.
+
+    Returns ``(old_b64, new_b64, width, height)``. Raises if either fetch fails —
+    the caller decides whether comparison imagery is optional.
+    """
+    old_rgb, old_valid = fetch_true_color_base(
+        polygon, old_year, old_month, client_id, client_secret, whole_month=False,
+    )
+    new_rgb, new_valid = fetch_true_color_base(
+        polygon, new_year, new_month, client_id, client_secret, whole_month=False,
+    )
+
+    low, high = _joint_stretch_bounds([(old_rgb, old_valid), (new_rgb, new_valid)])
+    logger.info("Before/after shared stretch: reflectance %.4f-%.4f", low, high)
+
+    old_img = _render_compare_true_color(old_rgb, old_valid, low, high)
+    new_img = _render_compare_true_color(new_rgb, new_valid, low, high)
+    return (
+        _encode_png(old_img, 1),
+        _encode_png(new_img, 1),
+        min(old_img.width, new_img.width),
+        min(old_img.height, new_img.height),
+    )
+
+
 def _render_base_true_color(rgb: np.ndarray, valid: np.ndarray) -> Image.Image:
     """Stretch a fetched native-resolution true-colour array into an RGBA image.
 
@@ -814,6 +1073,30 @@ def _decode_grid(codes: list[list[int]]) -> np.ndarray:
 
 def _clamp_int(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
+
+
+def _crop_png_b64(b64: str | None, cached: tuple, target: tuple) -> tuple[str | None, int, int]:
+    """Crop a base64 PNG spanning ``cached`` bounds down to ``target`` bounds.
+
+    Both are ``(west, south, east, north)``. Returns ``(base64, width, height)``,
+    or ``(None, 0, 0)`` when there was nothing to crop.
+    """
+    if not b64:
+        return None, 0, 0
+    cw, cs, ce, cn = cached
+    tw, ts, te, tn = target
+    lon_span = (ce - cw) or 1e-9
+    lat_span = (cn - cs) or 1e-9
+
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+    width, height = img.size
+    x0 = _clamp_int(int(round((tw - cw) / lon_span * width)), 0, width - 1)
+    x1 = _clamp_int(int(round((te - cw) / lon_span * width)), x0 + 1, width)
+    y0 = _clamp_int(int(round((cn - tn) / lat_span * height)), 0, height - 1)
+    y1 = _clamp_int(int(round((cn - ts) / lat_span * height)), y0 + 1, height)
+
+    cropped = img.crop((x0, y0, x1, y1))
+    return _encode_png(cropped, 1), cropped.width, cropped.height
 
 
 def _crop_classify(contained: dict, req_bbox: tuple) -> dict:
@@ -936,10 +1219,31 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
     stats["deforestation"] = deforestation
     stats["waterLoss"] = water_loss
 
+    # The stored rasters span the whole cached area, so crop all three to the
+    # sub-box. They share bounds and shape, so one set of dimensions covers them.
+    cached_bounds = (cw, cs, ce, cn)
+    old_png, sub_w, sub_h = _crop_png_b64(payload.get("oldImagePngBase64"), cached_bounds, req_bbox)
+    new_png, _, _ = _crop_png_b64(payload.get("newImagePngBase64"), cached_bounds, req_bbox)
+    deforestation_png, mask_w, mask_h = _crop_png_b64(
+        payload.get("deforestationPngBase64"), cached_bounds, req_bbox,
+    )
+    water_loss_png, _, _ = _crop_png_b64(
+        payload.get("waterLossPngBase64"), cached_bounds, req_bbox,
+    )
+    if sub_w < 1 or sub_h < 1:
+        sub_w, sub_h = mask_w, mask_h
+
     return {
         "status": "success",
         "message": f"Analysis complete: {len(changes)} changed pixels detected",
         "changes": changes,
+        "oldImagePngBase64": old_png,
+        "newImagePngBase64": new_png,
+        "deforestationPngBase64": deforestation_png,
+        "waterLossPngBase64": water_loss_png,
+        "imageWidth": sub_w,
+        "imageHeight": sub_h,
+        "bounds": {"north": rn, "south": rs, "east": re_, "west": rw},
         "stats": stats,
         "requestId": payload.get("requestId"),
         "cached": True,

@@ -294,7 +294,10 @@ class _LandUseScreenState extends State<LandUseScreen> {
 
   Widget _buildPlaceholder() {
     return Center(
-      child: Padding(
+      // On a small phone the controls panel can take half the height, leaving
+      // the scene area too short for this message once the copy wraps. Scrolling
+      // keeps it readable instead of clipping it.
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -326,24 +329,35 @@ class _LandUseScreenState extends State<LandUseScreen> {
     final present = result.presentClasses;
     if (present.isEmpty) return const SizedBox.shrink();
 
-    return Positioned(
-      top: 12,
-      left: 12,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.72),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            for (final c in present) ...[
-              _LegendRow(color: c.color, label: c.name, percent: c.percent),
-              if (c != present.last) const SizedBox(height: 6),
-            ],
-          ],
+    // Filling the stack (rather than pinning a free-floating box at top-left)
+    // bounds the legend to the viewer, so a scene with many classes on a short
+    // phone viewport scrolls the list instead of spilling past the bottom.
+    // Padding/Align are layout-only, so this does not block gestures on the
+    // scene behind it.
+    return Positioned.fill(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Align(
+          alignment: Alignment.topLeft,
+          child: SingleChildScrollView(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.72),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final c in present) ...[
+                    _LegendRow(color: c.color, label: c.name, percent: c.percent),
+                    if (c != present.last) const SizedBox(height: 6),
+                  ],
+                ],
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -354,30 +368,37 @@ class _LandUseScreenState extends State<LandUseScreen> {
       child: ColoredBox(
         color: Colors.black54,
         child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 44,
-                height: 44,
-                child: CircularProgressIndicator(color: _accent, strokeWidth: 3),
-              ),
-              SizedBox(height: 16),
-              Text(
-                'Classifying land cover…',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
+          // The scene area is only ~230 px tall on a small phone once the panel
+          // takes its half; this message is taller than that at large text
+          // scales, so let it scroll rather than clip.
+          child: SingleChildScrollView(
+            padding: EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 44,
+                  height: 44,
+                  child:
+                      CircularProgressIndicator(color: _accent, strokeWidth: 3),
                 ),
-              ),
-              SizedBox(height: 6),
-              Text(
-                'Building the Sentinel-2 composite and labelling every\npixel — this can take a few minutes.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-            ],
+                SizedBox(height: 16),
+                Text(
+                  'Classifying land cover…',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                SizedBox(height: 6),
+                Text(
+                  'Building the Sentinel-2 composite and labelling every\npixel — this can take a few minutes.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -413,9 +434,13 @@ class _LandUseScreenState extends State<LandUseScreen> {
           children: [
             const Icon(Icons.crop_free, size: 18, color: _ink),
             const SizedBox(width: 8),
-            Text(
-              '${widget.bounds.areaKm2.toStringAsFixed(2)} km² selected',
-              style: const TextStyle(fontWeight: FontWeight.w700, color: _ink),
+            // As in AnalysisRunScreen: wrap rather than overflow when the area
+            // string or the user's text scale grows.
+            Flexible(
+              child: Text(
+                '${widget.bounds.areaKm2.toStringAsFixed(2)} km² selected',
+                style: const TextStyle(fontWeight: FontWeight.w700, color: _ink),
+              ),
             ),
           ],
         ),

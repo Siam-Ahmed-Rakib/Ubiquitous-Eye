@@ -52,8 +52,15 @@ class ServiceDetailPage extends StatelessWidget {
                         padding: const EdgeInsets.only(top: 10),
                         child: Text(
                           service.name,
-                          style: const TextStyle(
-                            fontSize: 26,
+                          // Service names are long single words
+                          // ("Deforestation") that cannot wrap, so between the
+                          // two icon buttons a 26 px title runs off a small
+                          // phone. Step the size down on narrow screens and cap
+                          // the line count rather than overflowing.
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: context.responsive(phone: 22, tablet: 26),
                             fontWeight: FontWeight.w800,
                             height: 1.1,
                             color: _ink,
@@ -83,9 +90,13 @@ class ServiceDetailPage extends StatelessWidget {
                   children: [
                     Icon(Icons.schedule, size: 20, color: Colors.grey.shade600),
                     const SizedBox(width: 10),
-                    Text(
-                      service.delivery,
-                      style: TextStyle(fontSize: 16, color: Colors.grey.shade700),
+                    // Wraps instead of running off the edge once the label or
+                    // the user's text scale outgrows a narrow phone.
+                    Flexible(
+                      child: Text(
+                        service.delivery,
+                        style: TextStyle(fontSize: 16, color: Colors.grey.shade700),
+                      ),
                     ),
                   ],
                 ),

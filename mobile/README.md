@@ -82,14 +82,73 @@ Uses the **same** `POST /api/sentinel/analyze` endpoint the React web
 2. Tap **CONTINUE** → the **Change Analysis** screen.
 3. Choose an *older* and a *newer* month, then **RUN ANALYSIS**.
 4. The backend builds bimonthly Sentinel-2 composites for both dates, classifies
-   them, and returns the changed pixels. They're drawn on the map — **red =
-   deforestation** (`mask 1`), **orange = water loss** (`mask 2`) — with
-   pixel-count stats below.
+   them, and returns the changed pixels — **red = deforestation** (`mask 1`),
+   **orange = water loss** (`mask 2`) — with pixel-count stats below.
+
+#### Before / after comparison
+
+The result opens on a **side-by-side view of the two scenes** the analysis
+actually compared, with the change mask over both. This is the default whenever
+the backend returns imagery; a **Before / after ↔ Map** toggle switches to the
+older map-with-points view for geographic context.
+
+Alongside the changed-pixel list the endpoint returns four pixel-aligned RGBA
+PNGs spanning the AOI's bounding box, base64-encoded:
+
+| Field | What it is |
+| --- | --- |
+| `oldImagePngBase64` | Cloud-masked true-colour scene for the **older** date |
+| `newImagePngBase64` | Cloud-masked true-colour scene for the **newer** date |
+| `deforestationPngBase64` | `mask 1` pixels, painted red `#E53935` |
+| `waterLossPngBase64` | `mask 2` pixels, painted orange `#FB8C00` |
+
+All four are the same size and span the same box, so stacking them in one
+`AspectRatio` registers them cell for cell — a red pixel sits exactly on the
+ground it was derived from. The imagery comes from `fetch_true_color_base`, the
+same native-10 m cloud-masked fetch the land-use backdrop uses, so it is sharper
+than the 30 m composite the classifier reads.
+
+**The mask is painted on the AFTER scene only.** BEFORE is deliberately left
+clear: it is the reference, and colouring it would hide the very ground you are
+comparing the marks against. Look straight across from a mark to see what that
+spot used to be.
+
+Both scenes are rendered through **one shared stretch** — see
+`_render_compare_true_color` in `server/api_server.py`. The land-use backdrop
+stretches each band to its own 2–98% range per image, which is wrong for a pair:
+per-image gives each date its own colour mapping (so a normalisation artefact
+reads as change), and per-band neutralises the real colour balance (vegetation
+over-saturates, water crushes to black). One range across every band of both
+dates keeps the colours the sensor recorded and makes the pair comparable.
+
+Each change class is a **separate raster** so it can be toggled on its own —
+turning water loss off to study deforestation alone is the common case. Both
+panes share one `TransformationController`, so zooming or panning either moves
+the other identically and the two always show the same ground.
+
+> **On the overlay's size:** one changed pixel is a single 10 m cell, which lands
+> on roughly one pixel of a ~1500 px render — invisible in practice. The backend
+> dilates each hit by a few pixels (`CHANGE_DILATION_DIVISOR`) purely so it can
+> be seen. The **counts in the stat cards are never dilated** — they are exact.
+> Drop the opacity slider to 0 to see the untouched scenes.
+
+> **On response size:** this ships two full scenes instead of one, so an analyze
+> response is now several MB where it used to be a few hundred KB (a 25 km² AOI
+> is ≈ 0.9 MB of base64; `fetch_true_color_base` caps the longest side at 1536 px,
+> so the ceiling is roughly 8 MB). Fine on localhost or Wi-Fi, noticeably slow on
+> a mobile connection. The change masks are sparse and compress to ~1 KB each, so
+> the imagery is the entire cost. The Sentinel Hub fetches still dominate the
+> wall-clock time either way.
+
+Because the cached response shape changed, `ANALYZE_CACHE_KIND` in
+`server/api_server.py` is `analyze_v2`; entries written before the imagery
+existed no longer match and are simply recomputed.
 
 Relevant code:
 [`lib/services/analysis_service.dart`](lib/services/analysis_service.dart) (HTTP),
 [`lib/models/analysis_result.dart`](lib/models/analysis_result.dart) (parsing),
-[`lib/screens/analysis/analysis_run_screen.dart`](lib/screens/analysis/analysis_run_screen.dart) (UI).
+[`lib/screens/analysis/analysis_run_screen.dart`](lib/screens/analysis/analysis_run_screen.dart) (screen),
+[`lib/widgets/before_after_compare.dart`](lib/widgets/before_after_compare.dart) (side-by-side view).
 
 ### Land use classification
 
@@ -229,13 +288,14 @@ lib/
     area_selection_screen.dart       Map + AOI selector + search + CTA
     placeholder_tab.dart             Stand-in for not-yet-built tabs
     analysis/
-      analysis_run_screen.dart       Run analysis: map overlay + dates + stats
+      analysis_run_screen.dart       Run analysis: before/after + map + dates + stats
       land_use_screen.dart           Land cover: raster overlay + opacity + breakdown
     analytics/
       analytics_page.dart            Catalog (responsive grid)
       service_detail_page.dart       Service description + Order
       analytics_image_options_page.dart
   widgets/
+    before_after_compare.dart        Side-by-side scenes + change mask, synced zoom
     bottom_nav_bar.dart              Shared destinations, AppBottomNavBar, AppNavRail
     selection_overlay.dart           Rectangle, handles, area badge (map layer)
     search_panel.dart                Search field + results dropdown
