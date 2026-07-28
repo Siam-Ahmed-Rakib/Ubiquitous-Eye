@@ -5,3 +5,14 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Claude Code local state. Holds settings.local.json and, more importantly,
+# .claude/worktrees/ — full working copies of the repo (models, GRANULE scratch
+# data, even a Frontend/.env). None of that belongs in version control.
+.claude/
+
+# Local clone of the Hugging Face Space, created by deploy/huggingface/sync-space.ps1
+deploy/huggingface/.space/
+
+# Flutter tool crash reports
+mobile/flutter_*.log
