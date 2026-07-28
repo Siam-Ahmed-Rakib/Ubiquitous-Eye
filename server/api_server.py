@@ -1405,6 +1405,10 @@ def classify_land_use():
             "gridW": width,
             "gridH": height,
             "resM": 30 * step,
+            # Stored with the grid so cache.py can decode it into per-location
+            # rows without importing this module (and without a second copy of
+            # the table drifting out of sync).
+            "codeToLabel": _CODE_TO_LABEL,
         }
         cache_put("classify", date_key, bbox_bounds, is_current, result, extras=extras)
         return jsonify(result)

@@ -66,6 +66,35 @@ _TABLE = "analysis_cache"
 # Per-class rows lifted out of a classify payload, one per land-cover class.
 _CLASS_TABLE = "classification_result"
 
+# The land-cover vocabulary. Four rows, ever — so the name and its display
+# colour are stored once here instead of being repeated on every result row.
+_LOOKUP_TABLE = "land_cover_class"
+
+# One row per ~30 m ground location, holding the most recent classification
+# known for it. Not a per-search log: see _store_points.
+_POINT_TABLE = "classification_point"
+
+# Point coordinates are snapped to this grid before storing. Cell centres are
+# derived from each search's own bounding box, so two searches covering the same
+# ground from differently-drawn polygons land a few metres apart and would never
+# compare equal as floats. Snapping to a fixed global grid makes the same ground
+# yield the same key regardless of how the area was selected. 0.00027 deg is
+# ~30 m, the finest resolution the classifier produces.
+_POINT_GRID_DEG = 0.00027
+
+# Rows per INSERT when writing the point map, which cuts a 20,000-cell grid from
+# thousands of round trips to a few dozen. SQLite historically caps a statement
+# at 999 parameters, so 300 rows x 3 per-row parameters is the safe ceiling
+# there; Postgres allows 65535, and bigger batches matter more against a remote
+# database where each statement also costs a round trip.
+_POINT_CHUNK_SQLITE = 300
+_POINT_CHUNK_PG = 1000
+
+# Mirrors ``_CODE_TO_LABEL`` in api_server.py, used to decode the stored label
+# grid. New writes carry their own copy in ``extras["codeToLabel"]`` and that is
+# preferred; this fallback only serves entries cached before that was added.
+_FALLBACK_CODE_TO_LABEL = ["", "Tree", "Crop", "Water", "Soil"]
+
 # Longest cache_key we can produce: analysis (<=16) + date_key (<=16) + four
 # 3-decimal coordinates, plus separators. ~60 chars in practice; 160 is headroom
 # that still bounds the column.
@@ -96,6 +125,11 @@ _json_columns = False
 # verbatim, exactly as before.
 _ts_column = False
 _date_columns = False
+
+# Dialect of the live engine. The derived tables are created by this module, so
+# unlike the columns above their types are known rather than reflected -- but
+# the casts still have to be emitted only on Postgres.
+_pg_dialect = False
 
 
 # ── Key building ──────────────────────────────────────────────────────────────
@@ -198,19 +232,37 @@ def _create_table_sql(pg: bool) -> str:
     """
 
 
+def _create_lookup_table_sql(pg: bool) -> str:
+    """DDL for the land-cover vocabulary.
+
+    Four rows for the life of the project (Tree/Crop/Water/Soil). The display
+    colour belongs here and nowhere else: it is a constant of the class, so
+    holding it on every result row would repeat the same seven characters
+    thousands of times. Rows referencing a class carry a SMALLINT id instead,
+    which is what makes the per-point table affordable.
+    """
+    id_col = "id SMALLSERIAL PRIMARY KEY" if pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    return f"""
+    CREATE TABLE IF NOT EXISTS {_LOOKUP_TABLE} (
+        {id_col},
+        name  VARCHAR(32) NOT NULL,
+        color VARCHAR(7),
+        CONSTRAINT uq_{_LOOKUP_TABLE}_name UNIQUE (name)
+    )
+    """
+
+
 def _create_class_table_sql(pg: bool) -> str:
-    """DDL for the per-class classification rows.
+    """DDL for the per-class summary of one analysed area.
 
-    One row per land-cover class per analysed area — four rows for a typical
-    classify (Tree/Crop/Water/Soil), so this stays small even though the parent
-    payload is large. The class breakdown already exists inside ``payload``;
-    holding it here as columns is what makes it *queryable*: "dominant class
-    near this point", "how has Water changed across periods", and so on.
+    One row per land-cover class per search — four rows for a typical classify
+    — so this stays small even though the parent payload is large. The breakdown
+    already exists inside ``payload``; holding it here as columns is what makes
+    it queryable.
 
-    ``cache_id`` is a real foreign key onto the parent's surrogate ``id``, with
-    ON DELETE CASCADE so purging a cache entry cannot leave orphans. The centre
-    point is denormalised onto each row so a point lookup is a single indexed
-    scan with no join.
+    No coordinates: the analysed area's centre is already on the parent row, so
+    repeating it here would be duplication. Join to ``analysis_cache`` for
+    location, or use ``classification_point`` for real per-location data.
     """
     id_col = "id BIGSERIAL PRIMARY KEY" if pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
     return f"""
@@ -218,14 +270,48 @@ def _create_class_table_sql(pg: bool) -> str:
         {id_col},
         cache_id    BIGINT NOT NULL
                     REFERENCES {_TABLE} (id) ON DELETE CASCADE,
-        class_name  VARCHAR(32) NOT NULL,
-        color       VARCHAR(7),
-        longitude   DOUBLE PRECISION,
-        latitude    DOUBLE PRECISION,
+        class_id    SMALLINT NOT NULL
+                    REFERENCES {_LOOKUP_TABLE} (id),
         pixel_count INTEGER NOT NULL DEFAULT 0,
         percent     DOUBLE PRECISION NOT NULL DEFAULT 0,
         area_km2    DOUBLE PRECISION NOT NULL DEFAULT 0,
-        CONSTRAINT uq_{_CLASS_TABLE}_cache_class UNIQUE (cache_id, class_name)
+        CONSTRAINT uq_{_CLASS_TABLE}_cache_class UNIQUE (cache_id, class_id)
+    )
+    """
+
+
+def _create_point_table_sql(pg: bool) -> str:
+    """DDL for the per-location classification map.
+
+    Unlike the tables above this is **not** a log of searches — it is the
+    current best answer for each piece of ground. One row per snapped ~30 m
+    location, holding the classification from the most recently *observed*
+    period seen for it. Searching June 2024 after someone searched June 2025
+    leaves the row alone; searching June 2026 replaces it. See ``_store_points``.
+
+    ``observed_on`` is the analysed period (``period_start``), not the time the
+    row was written — that distinction is the whole point. ``updated_at`` keeps
+    the write time separately for auditing.
+
+    ``cache_id`` records which search last wrote the row, but uses ON DELETE SET
+    NULL rather than CASCADE: evicting a cached response must not delete the
+    map, because the classification remains true after the cached PNG is gone.
+    """
+    id_col = "id BIGSERIAL PRIMARY KEY" if pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    date_type = "DATE" if pg else "TEXT"
+    ts_type = "TIMESTAMPTZ" if pg else "TEXT"
+    return f"""
+    CREATE TABLE IF NOT EXISTS {_POINT_TABLE} (
+        {id_col},
+        longitude   DOUBLE PRECISION NOT NULL,
+        latitude    DOUBLE PRECISION NOT NULL,
+        class_id    SMALLINT NOT NULL
+                    REFERENCES {_LOOKUP_TABLE} (id),
+        observed_on {date_type} NOT NULL,
+        cache_id    BIGINT
+                    REFERENCES {_TABLE} (id) ON DELETE SET NULL,
+        updated_at  {ts_type} NOT NULL,
+        CONSTRAINT uq_{_POINT_TABLE}_location UNIQUE (longitude, latitude)
     )
     """
 
@@ -248,11 +334,67 @@ def _index_sqls() -> list[str]:
         f"ON {_TABLE} (longitude, latitude)",
         f"CREATE INDEX IF NOT EXISTS idx_{_CLASS_TABLE}_cache "
         f"ON {_CLASS_TABLE} (cache_id)",
-        f"CREATE INDEX IF NOT EXISTS idx_{_CLASS_TABLE}_point "
-        f"ON {_CLASS_TABLE} (longitude, latitude)",
         f"CREATE INDEX IF NOT EXISTS idx_{_CLASS_TABLE}_class "
-        f"ON {_CLASS_TABLE} (class_name)",
+        f"ON {_CLASS_TABLE} (class_id)",
+        # The UNIQUE (longitude, latitude) constraint already indexes location
+        # lookups, so only the other two access paths need one of their own.
+        f"CREATE INDEX IF NOT EXISTS idx_{_POINT_TABLE}_class "
+        f"ON {_POINT_TABLE} (class_id)",
+        f"CREATE INDEX IF NOT EXISTS idx_{_POINT_TABLE}_observed "
+        f"ON {_POINT_TABLE} (observed_on)",
     ]
+
+
+def snap_point(lon: float, lat: float) -> tuple[float, float]:
+    """Snap a coordinate to the shared ~30 m point grid.
+
+    Rounded to 8 decimals afterwards so the same ground always produces a
+    bit-identical float, which is what the UNIQUE constraint compares.
+    """
+    return (
+        round(round(float(lon) / _POINT_GRID_DEG) * _POINT_GRID_DEG, 8),
+        round(round(float(lat) / _POINT_GRID_DEG) * _POINT_GRID_DEG, 8),
+    )
+
+
+def _grid_points(extras, bounds):
+    """Yield ``(lon, lat, label)`` for every classified cell in a stored grid.
+
+    ``extras`` is what classify wrote: nested integer codes plus the grid size.
+    ``bounds`` is the parent row's ``(west, south, east, north)``. Cells run west
+    to east across columns and **north to south** down rows, matching
+    ``_crop_classify`` in api_server.py.
+
+    Cells the model could not classify (code 0, an empty label) are skipped —
+    storing "unknown" would overwrite a real observation from another search.
+    """
+    if not isinstance(extras, dict):
+        return
+    codes = extras.get("labels")
+    if not isinstance(codes, list) or not codes:
+        return
+
+    table = extras.get("codeToLabel") or _FALLBACK_CODE_TO_LABEL
+    west, south, east, north = (float(v) for v in bounds)
+    height = len(codes)
+    width = len(codes[0]) if isinstance(codes[0], list) else 0
+    if not width or not height:
+        return
+
+    lon_span = (east - west) or 1e-9
+    lat_span = (north - south) or 1e-9
+
+    for r, row in enumerate(codes):
+        lat = north - (r + 0.5) * lat_span / height
+        for c, code in enumerate(row):
+            try:
+                label = table[int(code)]
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not label:
+                continue
+            lon = west + (c + 0.5) * lon_span / width
+            yield lon, lat, label
 
 
 def _period_dates(date_key: str):
@@ -436,10 +578,11 @@ def _migrate_sqlite(engine) -> None:
     old = f"{_TABLE}_old"
 
     with engine.begin() as conn:
-        # The child table's rows point at ids in the table about to be dropped.
-        # It is pure derived data (rebuilt on the next write), so discard it
-        # rather than trying to remap the keys.
+        # Both derived tables reference ids in the table about to be dropped,
+        # and a rebuild renumbers them. They are regenerated from the payloads
+        # by _backfill_derived, so discard rather than remap.
         conn.execute(text(f"DROP TABLE IF EXISTS {_CLASS_TABLE}"))
+        conn.execute(text(f"DROP TABLE IF EXISTS {_POINT_TABLE}"))
         conn.execute(text(f"DROP TABLE IF EXISTS {old}"))
         conn.execute(text(f"ALTER TABLE {_TABLE} RENAME TO {old}"))
         conn.execute(text(_create_table_sql(pg=False)))
@@ -453,49 +596,80 @@ def _migrate_sqlite(engine) -> None:
     logger.info("Result cache schema rebuilt (SQLite)")
 
 
-def _backfill_classes(engine) -> int:
-    """Populate classification_result from payloads already in the cache.
+def _backfill_derived(engine):
+    """Populate both derived tables from payloads already in the cache.
 
-    Without this the table stays empty until every cached classify is recomputed
-    — the breakdown is already stored, just locked inside the JSON.
+    Without this they stay empty until every cached classify is recomputed — the
+    data is already stored, just locked inside the JSON.
 
-    On Postgres only ``payload->'classes'`` is selected, never the whole payload:
-    a classify response carries two base64 PNGs, so pulling the full documents
-    for every row would move tens of megabytes to extract a few hundred bytes.
-    SQLite has no such projection, but it is the test backend with tiny rows.
+    Rows are processed oldest period first so the point map converges on the
+    same answer it would have reached had the searches been replayed in order.
+    The conditional upsert makes that ordering belt-and-braces rather than load
+    bearing, but it keeps the write count down.
+
+    On Postgres only the sub-documents actually needed are selected, never the
+    whole payload: a classify response carries two base64 PNGs, so pulling full
+    documents for every row would move tens of megabytes to extract a few
+    hundred bytes of class breakdown. SQLite has no such projection, but it is
+    the test backend with tiny rows.
     """
     from sqlalchemy import text
 
     pg = _is_postgres(engine)
-    missing = (
-        f"NOT EXISTS (SELECT 1 FROM {_CLASS_TABLE} c WHERE c.cache_id = a.id)"
-    )
+    missing = f"NOT EXISTS (SELECT 1 FROM {_CLASS_TABLE} c WHERE c.cache_id = a.id)"
+    order = "ORDER BY a.period_start NULLS FIRST" if pg else "ORDER BY a.period_start"
     if pg:
         sql = (
-            f"SELECT a.id, a.longitude, a.latitude, a.payload->'classes' "
+            f"SELECT a.id, a.longitude, a.latitude, a.payload->'classes', "
+            f"       a.extras, a.west, a.south, a.east, a.north, a.period_start "
             f"FROM {_TABLE} a "
-            f"WHERE jsonb_typeof(a.payload->'classes') = 'array' AND {missing}"
+            f"WHERE jsonb_typeof(a.payload->'classes') = 'array' AND {missing} {order}"
         )
     else:
         sql = (
-            f"SELECT a.id, a.longitude, a.latitude, a.payload "
-            f"FROM {_TABLE} a WHERE {missing}"
+            f"SELECT a.id, a.longitude, a.latitude, a.payload, "
+            f"       a.extras, a.west, a.south, a.east, a.north, a.period_start "
+            f"FROM {_TABLE} a WHERE {missing} {order}"
         )
 
-    written = 0
+    summaries = points = 0
     with engine.begin() as conn:
-        for row_id, lon, lat, blob in conn.execute(text(sql)).fetchall():
+        rows = conn.execute(text(sql)).fetchall()
+        for row in rows:
+            (row_id, lon, lat, blob, extras_blob,
+             west, south, east, north, period_start) = row
             classes = _json_load(blob)
             if not pg:  # whole payload came back; dig out the array
                 classes = classes.get("classes") if isinstance(classes, dict) else None
             if not isinstance(classes, list) or not classes:
                 continue
-            written += _insert_classes(
+
+            summaries += _insert_classes(
                 conn, row_id, classes,
                 lon if lon is not None else 0.0,
                 lat if lat is not None else 0.0,
             )
-    return written
+
+            observed = _as_date(period_start)
+            if observed is not None and None not in (west, south, east, north):
+                points += _store_points(
+                    conn, row_id, _json_load(extras_blob),
+                    (west, south, east, north), observed,
+                )
+    return summaries, points
+
+
+def _as_date(value):
+    """Coerce a stored period value to a ``date``.
+
+    Postgres hands back a real date; SQLite stores the ISO string it was given.
+    """
+    if value is None or isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _init_schema(engine) -> None:
@@ -518,10 +692,19 @@ def _init_schema(engine) -> None:
         with engine.begin() as conn:
             conn.execute(text(_create_table_sql(pg)))
 
-    # The child table is additive: created whenever it is missing, including on
-    # a database whose parent table predates it.
+    # The derived tables are additive: created whenever missing, including on a
+    # database whose parent table predates them. An earlier classification_result
+    # kept the class name and colour on every row; it is pure derived data, so
+    # the cheapest correct migration is to drop it and let the backfill below
+    # rebuild it against the lookup table.
     with engine.begin() as conn:
+        if inspect(engine).has_table(_CLASS_TABLE):
+            existing = {c["name"] for c in inspect(engine).get_columns(_CLASS_TABLE)}
+            if "class_id" not in existing:
+                conn.execute(text(f"DROP TABLE {_CLASS_TABLE}"))
+        conn.execute(text(_create_lookup_table_sql(pg)))
         conn.execute(text(_create_class_table_sql(pg)))
+        conn.execute(text(_create_point_table_sql(pg)))
 
     # Indexes are created separately from the tables so that a failure to add
     # one (e.g. a name already taken by an old schema) cannot cost us the table.
@@ -532,19 +715,11 @@ def _init_schema(engine) -> None:
         except Exception as exc:  # pragma: no cover - depends on external DB
             logger.warning("Could not create index (%s)", exc)
 
-    # Lift the class breakdown out of payloads cached before this table existed.
-    # Purely derived data, so a failure here costs nothing but an emptier table.
-    try:
-        filled = _backfill_classes(engine)
-        if filled:
-            logger.info("Backfilled %d classification row(s) from cached payloads", filled)
-    except Exception as exc:  # pragma: no cover - depends on external DB
-        logger.warning("Classification backfill skipped (%s)", exc)
-
     # Whether writes need an explicit cast is read back from the database rather
     # than assumed, so a migration that could not run still leaves a working
-    # (text-column) cache instead of failing every insert.
-    global _ts_column, _date_columns
+    # (text-column) cache instead of failing every insert. This must settle
+    # before the backfill below, which writes through the same code path.
+    global _ts_column, _date_columns, _pg_dialect
     types = {
         c["name"]: str(c["type"]).upper()
         for c in inspect(engine).get_columns(_TABLE)
@@ -552,6 +727,20 @@ def _init_schema(engine) -> None:
     _json_columns = "JSON" in types.get("payload", "")
     _ts_column = "TIMESTAMP" in types.get("created_at", "")
     _date_columns = "DATE" in types.get("period_start", "")
+    _pg_dialect = pg
+
+    # Lift the class breakdown and the point map out of payloads cached before
+    # these tables existed. Purely derived data, so a failure here costs nothing
+    # but an emptier table.
+    try:
+        summaries, points = _backfill_derived(engine)
+        if summaries or points:
+            logger.info(
+                "Backfilled %d class row(s) and %d point(s) from cached payloads",
+                summaries, points,
+            )
+    except Exception as exc:  # pragma: no cover - depends on external DB
+        logger.warning("Derived-table backfill skipped (%s)", exc)
 
 
 def _get_engine():
@@ -583,6 +772,7 @@ def _get_engine():
 def reset() -> None:
     """Test hook: drop the memoised engine so the next call rebuilds from env."""
     global _engine, _engine_ready, _json_columns, _ts_column, _date_columns
+    global _pg_dialect
     if _engine is not None:
         try:
             _engine.dispose()
@@ -593,6 +783,7 @@ def reset() -> None:
     _json_columns = False
     _ts_column = False
     _date_columns = False
+    _pg_dialect = False
 
 
 # ── JSON column helpers ───────────────────────────────────────────────────────
@@ -685,48 +876,96 @@ def cache_get(analysis: str, date_key: str, bbox, is_current: bool):
         return None
 
 
-def _store_classes(conn, cache_key: str, payload, lon: float, lat: float) -> int:
-    """Normalise a classify payload's ``classes`` array into ``classification_result``.
+def _store_derived(conn, cache_key, payload, extras, bounds, lon, lat, observed_on):
+    """Populate both derived tables for a row that was just written.
 
-    Runs inside the caller's transaction, on the connection that just inserted
-    the parent row. A payload without a well-formed ``classes`` array (change
-    detection, an error response, an old cached shape) simply writes nothing.
+    Runs inside the caller's transaction, on the connection that inserted the
+    parent. A payload with no ``classes`` array (change detection, an error
+    response, an older cached shape) simply writes nothing.
 
     The parent id is re-read by ``cache_key`` rather than captured from the
-    INSERT: ``RETURNING`` is Postgres-only and ``lastrowid`` is SQLite-only, and
-    a cache write happens once per expensive analysis, so the extra round trip
-    is free next to the Sentinel Hub fetch it follows.
+    INSERT: ``RETURNING`` is Postgres-only and ``lastrowid`` SQLite-only, and a
+    cache write happens once per expensive analysis, so the extra round trip is
+    free next to the Sentinel Hub fetch it follows.
     """
     from sqlalchemy import text
 
     rows = payload.get("classes") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or not rows:
-        return 0
+        return 0, 0
 
     cache_id = conn.execute(
         text(f"SELECT id FROM {_TABLE} WHERE cache_key = :k"), {"k": cache_key},
     ).scalar()
     if cache_id is None:  # pragma: no cover - parent was just inserted
-        return 0
+        return 0, 0
 
-    return _insert_classes(conn, cache_id, rows, lon, lat)
+    summaries = _insert_classes(conn, cache_id, rows, lon, lat)
+    points = _store_points(conn, cache_id, extras, bounds, observed_on)
+    return summaries, points
 
 
-def _insert_classes(conn, cache_id, rows, lon: float, lat: float) -> int:
-    """Write one child row per well-formed class entry. Returns how many landed.
+def _resolve_class_ids(conn, wanted: dict) -> dict:
+    """Map class names to ``land_cover_class`` ids, creating rows as needed.
 
-    Entries are truncated to the column widths rather than rejected: a payload
-    is data we already returned to a client, so a surprising value should cost
-    at most one malformed cache row, never the write.
+    ``wanted`` is ``{name: colour or None}``. Resolved in one pass per write
+    rather than per row: there are only ever four classes, but a single classify
+    contributes tens of thousands of point rows, and looking the id up each time
+    would dominate the write.
     """
     from sqlalchemy import text
 
-    written = 0
-    for entry in rows:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
+    out = {}
+    for name, color in wanted.items():
+        name = str(name)[:32]
         if not name:
+            continue
+        color = str(color)[:7] if color else None
+        row = conn.execute(
+            text(f"SELECT id, color FROM {_LOOKUP_TABLE} WHERE name = :n"), {"n": name},
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                text(f"INSERT INTO {_LOOKUP_TABLE} (name, color) VALUES (:n, :c)"),
+                {"n": name, "c": color},
+            )
+            row = conn.execute(
+                text(f"SELECT id, color FROM {_LOOKUP_TABLE} WHERE name = :n"), {"n": name},
+            ).fetchone()
+        elif color and not row[1]:
+            # Learned the colour from a later payload than the one that created it.
+            conn.execute(
+                text(f"UPDATE {_LOOKUP_TABLE} SET color = :c WHERE id = :i"),
+                {"c": color, "i": row[0]},
+            )
+        if row is not None:
+            out[name] = row[0]
+    return out
+
+
+def _insert_classes(conn, cache_id, rows, lon: float, lat: float) -> int:
+    """Write one summary row per well-formed class entry. Returns how many landed.
+
+    ``lon``/``lat`` are accepted but not stored — the analysed centre lives on
+    the parent row. They remain in the signature because the backfill path reads
+    them from the parent anyway and callers are clearer for passing them.
+
+    Entries are skipped rather than rejected wholesale: a payload is data we
+    already returned to a client, so a surprising value should cost at most one
+    missing summary row, never the write.
+    """
+    from sqlalchemy import text
+
+    entries = [e for e in rows if isinstance(e, dict) and e.get("name")]
+    if not entries:
+        return 0
+
+    ids = _resolve_class_ids(conn, {e["name"]: e.get("color") for e in entries})
+
+    written = 0
+    for entry in entries:
+        class_id = ids.get(str(entry["name"])[:32])
+        if class_id is None:
             continue
         try:
             pixels = int(entry.get("pixels") or 0)
@@ -737,20 +976,94 @@ def _insert_classes(conn, cache_id, rows, lon: float, lat: float) -> int:
         conn.execute(
             text(
                 f"INSERT INTO {_CLASS_TABLE} "
-                f"(cache_id, class_name, color, longitude, latitude, "
-                f" pixel_count, percent, area_km2) "
-                f"VALUES (:cid, :n, :c, :lon, :lat, :px, :pct, :area)"
+                f"(cache_id, class_id, pixel_count, percent, area_km2) "
+                f"VALUES (:cid, :kid, :px, :pct, :area)"
             ),
-            {
-                "cid": cache_id,
-                "n": str(name)[:32],
-                "c": str(entry.get("color") or "")[:7] or None,
-                "lon": lon, "lat": lat,
-                "px": pixels, "pct": percent, "area": area,
-            },
+            {"cid": cache_id, "kid": class_id, "px": pixels, "pct": percent, "area": area},
         )
         written += 1
     return written
+
+
+def _store_points(conn, cache_id, extras, bounds, observed_on) -> int:
+    """Upsert the per-location classification map for one analysed area.
+
+    This is the "latest observation wins" rule: a location already carrying a
+    newer ``observed_on`` is left untouched, so replaying an older month cannot
+    undo a newer one, whatever order the searches arrive in. Expressed as a
+    conditional ON CONFLICT so ordering is enforced by the database rather than
+    by hoping callers write in sequence.
+
+    Returns the number of rows offered, not the number actually changed — the
+    database decides the latter and reporting it would need another round trip.
+    """
+    from sqlalchemy import text
+
+    if observed_on is None or cache_id is None:
+        return 0
+
+    # Collapse the grid onto the snapped point grid first. Neighbouring cells
+    # can round to the same location; last one wins, which is arbitrary but
+    # consistent, and it keeps the executemany batch free of self-conflicts
+    # (Postgres rejects a batch that hits the same key twice).
+    collapsed = {}
+    labels = {}
+    for lon, lat, label in _grid_points(extras, bounds):
+        collapsed[snap_point(lon, lat)] = label
+        labels[label] = None
+    if not collapsed:
+        return 0
+
+    ids = _resolve_class_ids(conn, labels)
+    now = datetime.now(timezone.utc).isoformat()
+    observed = observed_on.isoformat()
+
+    params = [
+        {"lon": lon, "lat": lat, "kid": ids[label],
+         "obs": observed, "cid": cache_id, "ts": now}
+        for (lon, lat), label in collapsed.items()
+        if label in ids
+    ]
+    if not params:
+        return 0
+
+    # Written as chunked multi-row INSERTs rather than one parameterised
+    # statement executed many times. psycopg2 implements executemany as a loop
+    # of individual round trips, which for a 20,000-cell grid measured at 67
+    # seconds against a local Postgres -- time that would be added to every
+    # classify response. Batching turns it into a few dozen statements.
+    obs_expr = "CAST(:obs AS DATE)" if _pg_dialect else ":obs"
+    ts_expr = "CAST(:ts AS TIMESTAMPTZ)" if _pg_dialect else ":ts"
+    tail = (
+        f"ON CONFLICT (longitude, latitude) DO UPDATE SET "
+        f"  class_id    = EXCLUDED.class_id, "
+        f"  observed_on = EXCLUDED.observed_on, "
+        f"  cache_id    = EXCLUDED.cache_id, "
+        f"  updated_at  = EXCLUDED.updated_at "
+        f"WHERE {_POINT_TABLE}.observed_on < EXCLUDED.observed_on"
+    )
+
+    size = _POINT_CHUNK_PG if _pg_dialect else _POINT_CHUNK_SQLITE
+    for start in range(0, len(params), size):
+        chunk = params[start:start + size]
+        # observed_on / cache_id / updated_at are identical for every row in a
+        # write, so they are bound once and referenced from each tuple.
+        bound = {"obs": observed, "cid": cache_id, "ts": now}
+        tuples = []
+        for i, row in enumerate(chunk):
+            bound[f"x{i}"] = row["lon"]
+            bound[f"y{i}"] = row["lat"]
+            bound[f"k{i}"] = row["kid"]
+            tuples.append(f"(:x{i}, :y{i}, :k{i}, {obs_expr}, :cid, {ts_expr})")
+        conn.execute(
+            text(
+                f"INSERT INTO {_POINT_TABLE} "
+                f"(longitude, latitude, class_id, observed_on, cache_id, updated_at) "
+                f"VALUES {', '.join(tuples)} {tail}"
+            ),
+            bound,
+        )
+    return len(params)
 
 
 def cache_put(
@@ -795,6 +1108,11 @@ def cache_put(
             # on Postgres, but SQLite only enforces foreign keys when the
             # per-connection `PRAGMA foreign_keys` is on, which it is not by
             # default. Deleting here is correct on both.
+            #
+            # classification_point is deliberately NOT deleted. It is a map of
+            # ground truth, not a child of this response: its rows outlive the
+            # cached payload that produced them, which is why its foreign key is
+            # ON DELETE SET NULL.
             conn.execute(
                 text(
                     f"DELETE FROM {_CLASS_TABLE} WHERE cache_id IN "
@@ -824,8 +1142,13 @@ def cache_put(
                     "ts": datetime.now(timezone.utc).isoformat(),
                 },
             )
-            _store_classes(conn, key, payload, lon, lat)
-        logger.info("Cache STORE: %s (%d bytes)", key, len(body))
+            summaries, points = _store_derived(
+                conn, key, payload, extras, (w, s, e, n), lon, lat, period_start,
+            )
+        logger.info(
+            "Cache STORE: %s (%d bytes, %d class rows, %d points)",
+            key, len(body), summaries, points,
+        )
     except Exception as exc:  # pragma: no cover - depends on external DB
         logger.warning("Cache write failed (%s) — response still returned", exc)
 

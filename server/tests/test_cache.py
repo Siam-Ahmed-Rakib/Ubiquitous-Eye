@@ -168,6 +168,16 @@ _CLASSES = [
 ]
 
 
+def _class_rows(conn):
+    """Summary rows joined back to their class names, ordered by share."""
+    return conn.execute(text(
+        f"SELECT k.name, k.color, r.pixel_count, r.percent, r.area_km2 "
+        f"FROM {cache._CLASS_TABLE} r "
+        f"JOIN {cache._LOOKUP_TABLE} k ON k.id = r.class_id "
+        f"ORDER BY r.percent DESC"
+    )).fetchall()
+
+
 def test_classes_are_normalised_into_their_own_table(sqlite_cache):
     """The class breakdown becomes queryable rows, not just JSON in the payload."""
     cache.cache_put("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), False,
@@ -175,25 +185,42 @@ def test_classes_are_normalised_into_their_own_table(sqlite_cache):
 
     engine = cache._get_engine()
     with engine.connect() as conn:
-        rows = conn.execute(text(
-            f"SELECT class_name, color, longitude, latitude, pixel_count, percent, area_km2 "
-            f"FROM {cache._CLASS_TABLE} ORDER BY percent DESC"
-        )).fetchall()
+        rows = _class_rows(conn)
 
     assert [r[0] for r in rows] == ["Tree", "Water"]
-    assert rows[0][1] == "#2E7D32"
-    # Each row carries the analysed area's centre, so a point lookup needs no join.
-    assert rows[0][2] == pytest.approx(90.1)
-    assert rows[0][3] == pytest.approx(23.8)
-    assert (rows[0][4], rows[0][5], rows[0][6]) == (120, 60.0, 1.2)
+    assert (rows[0][2], rows[0][3], rows[0][4]) == (120, 60.0, 1.2)
 
-    # id is the primary key here too, and cache_id is a real foreign key.
+    # id is the primary key here too, and both foreign keys are real.
     insp = inspect(engine)
     assert insp.get_pk_constraint(cache._CLASS_TABLE)["constrained_columns"] == ["id"]
-    fk = insp.get_foreign_keys(cache._CLASS_TABLE)[0]
-    assert fk["constrained_columns"] == ["cache_id"]
-    assert fk["referred_table"] == cache._TABLE
-    assert fk["referred_columns"] == ["id"]
+    refs = {
+        fk["constrained_columns"][0]: fk["referred_table"]
+        for fk in insp.get_foreign_keys(cache._CLASS_TABLE)
+    }
+    assert refs == {"cache_id": cache._TABLE, "class_id": cache._LOOKUP_TABLE}
+
+
+def test_colour_is_stored_once_in_the_lookup_not_per_row(sqlite_cache):
+    """The display colour is a constant of the class, so it lives in one place."""
+    bbox = (90.0, 23.7, 90.2, 23.9)
+    for month in ("2024-03", "2024-04", "2024-05"):
+        cache.cache_put("classify", month, bbox, False,
+                        {"status": "success", "classes": _CLASSES})
+
+    with cache._get_engine().connect() as conn:
+        # Three searches wrote six summary rows...
+        assert conn.execute(
+            text(f"SELECT COUNT(*) FROM {cache._CLASS_TABLE}")
+        ).scalar() == 6
+        # ...but the vocabulary still holds exactly two classes, one colour each.
+        vocab = conn.execute(text(
+            f"SELECT name, color FROM {cache._LOOKUP_TABLE} ORDER BY name"
+        )).fetchall()
+    assert vocab == [("Tree", "#2E7D32"), ("Water", "#1565C0")]
+
+    # The summary table has no colour column at all to fall out of sync.
+    cols = {c["name"] for c in inspect(cache._get_engine()).get_columns(cache._CLASS_TABLE)}
+    assert "color" not in cols and "class_name" not in cols
 
 
 def test_classes_are_replaced_when_an_entry_is_overwritten(sqlite_cache):
@@ -205,10 +232,131 @@ def test_classes_are_replaced_when_an_entry_is_overwritten(sqlite_cache):
     ]})
 
     with cache._get_engine().connect() as conn:
-        names = [r[0] for r in conn.execute(
-            text(f"SELECT class_name FROM {cache._CLASS_TABLE}")
-        )]
+        names = [r[0] for r in _class_rows(conn)]
     assert names == ["Soil"], "stale child rows must not survive an overwrite"
+
+
+# ── Per-location classification map ───────────────────────────────────────────
+
+def _grid_extras(rows):
+    """extras as classify writes them, from a grid of label strings."""
+    table = ["", "Tree", "Crop", "Water", "Soil"]
+    code = {name: i for i, name in enumerate(table)}
+    return {
+        "labels": [[code[v] for v in row] for row in rows],
+        "gridW": len(rows[0]),
+        "gridH": len(rows),
+        "resM": 30,
+        "codeToLabel": table,
+    }
+
+
+def _points(conn):
+    return dict(conn.execute(text(
+        f"SELECT p.longitude || ',' || p.latitude, k.name "
+        f"FROM {cache._POINT_TABLE} p "
+        f"JOIN {cache._LOOKUP_TABLE} k ON k.id = p.class_id"
+    )).fetchall())
+
+
+def test_points_are_stored_per_location_with_grid_orientation(sqlite_cache):
+    """Row 0 of the grid is the NORTH edge, columns run west to east."""
+    bbox = (90.0, 23.7, 90.2, 23.9)
+    extras = _grid_extras([["Tree", "Water"],
+                           ["Soil", "Crop"]])
+    cache.cache_put("classify", "2024-03", bbox, False,
+                    {"status": "success", "classes": _CLASSES}, extras=extras)
+
+    with cache._get_engine().connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT p.longitude, p.latitude, k.name FROM {cache._POINT_TABLE} p "
+            f"JOIN {cache._LOOKUP_TABLE} k ON k.id = p.class_id"
+        )).fetchall()
+
+    assert len(rows) == 4
+    by_name = {name: (lon, lat) for lon, lat, name in rows}
+    # Tree is grid (0,0): north-west. Crop is (1,1): south-east.
+    assert by_name["Tree"][1] > by_name["Soil"][1], "row 0 must be north"
+    assert by_name["Tree"][0] < by_name["Water"][0], "column 0 must be west"
+    assert by_name["Crop"][0] > by_name["Soil"][0]
+    assert by_name["Crop"][1] < by_name["Water"][1]
+
+
+def test_a_newer_observation_overwrites_a_location(sqlite_cache):
+    """The user's scenario: 2025, then 2024, then 2026, arriving in that order."""
+    bbox = (90.0, 23.7, 90.2, 23.9)
+    put = lambda month, label: cache.cache_put(
+        "classify", month, bbox, False,
+        {"status": "success", "classes": _CLASSES},
+        extras=_grid_extras([[label]]),
+    )
+
+    put("2025-06", "Tree")
+    with cache._get_engine().connect() as conn:
+        assert list(_points(conn).values()) == ["Tree"]
+
+    # Older search must NOT win.
+    put("2024-06", "Water")
+    with cache._get_engine().connect() as conn:
+        assert list(_points(conn).values()) == ["Tree"], "2024 must not overwrite 2025"
+
+    # Newer search must win.
+    put("2026-06", "Soil")
+    with cache._get_engine().connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT k.name, p.observed_on FROM {cache._POINT_TABLE} p "
+            f"JOIN {cache._LOOKUP_TABLE} k ON k.id = p.class_id"
+        )).fetchall()
+    assert rows[0][0] == "Soil"
+    assert str(rows[0][1]) == "2026-06-01"
+
+
+def test_same_ground_from_differently_drawn_areas_is_one_row(sqlite_cache):
+    """Snapping is what makes the overwrite rule fire at all.
+
+    Cell centres come from each search's own bounding box, so two overlapping
+    but differently-drawn selections land micrometres apart. Without snapping
+    they would accumulate as separate rows and never overwrite.
+    """
+    a = (90.0, 23.7, 90.0027, 23.7027)
+    b = (90.00001, 23.70001, 90.00271, 23.70271)  # ~1 m offset
+    assert cache.snap_point(90.0013, 23.7013) == cache.snap_point(90.00131, 23.70131)
+
+    cache.cache_put("classify", "2024-06", a, False,
+                    {"status": "success", "classes": _CLASSES},
+                    extras=_grid_extras([["Tree"]]))
+    cache.cache_put("classify", "2025-06", b, False,
+                    {"status": "success", "classes": _CLASSES},
+                    extras=_grid_extras([["Water"]]))
+
+    with cache._get_engine().connect() as conn:
+        pts = _points(conn)
+    assert len(pts) == 1, "the same ground must be one row, not two"
+    assert list(pts.values()) == ["Water"], "the newer observation wins"
+
+
+def test_unclassified_cells_are_not_stored(sqlite_cache):
+    """Code 0 means the model had no cloud-free pixel; it must not overwrite."""
+    cache.cache_put("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), False,
+                    {"status": "success", "classes": _CLASSES},
+                    extras=_grid_extras([["Tree", ""], ["", "Water"]]))
+
+    with cache._get_engine().connect() as conn:
+        assert sorted(_points(conn).values()) == ["Tree", "Water"]
+
+
+def test_points_survive_eviction_of_the_cached_response(sqlite_cache):
+    """The map is ground truth, not a child of the payload that produced it."""
+    bbox = (90.0, 23.7, 90.2, 23.9)
+    cache.cache_put("classify", "2024-03", bbox, False,
+                    {"status": "success", "classes": _CLASSES},
+                    extras=_grid_extras([["Tree"]]))
+
+    engine = cache._get_engine()
+    with engine.begin() as conn:
+        conn.execute(text(f"DELETE FROM {cache._TABLE}"))
+    with engine.connect() as conn:
+        assert list(_points(conn).values()) == ["Tree"], "evicting the cache must keep the map"
 
 
 def test_payload_without_classes_writes_no_child_rows(sqlite_cache):
@@ -238,9 +386,7 @@ def test_classes_are_backfilled_from_already_cached_payloads(tmp_path, monkeypat
         # Re-opening recreates it and repopulates from the stored payload.
         cache.cache_get("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), is_current=False)
         with cache._get_engine().connect() as conn:
-            names = {r[0] for r in conn.execute(
-                text(f"SELECT class_name FROM {cache._CLASS_TABLE}")
-            )}
+            names = {r[0] for r in _class_rows(conn)}
         assert names == {"Tree", "Water"}
     finally:
         cache.reset()
