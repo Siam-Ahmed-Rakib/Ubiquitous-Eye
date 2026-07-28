@@ -21,6 +21,25 @@ foreign keys and admin tooling get a stable, opaque row identity. On Postgres
 from SQL instead of being opaque text. An existing table created by an earlier
 version is migrated in place on startup — see ``_migrate_postgres`` /
 ``_migrate_sqlite``.
+
+Columns are declared with the narrowest type that fits the data: bounded
+``VARCHAR`` for the short identifier strings, ``DATE`` for the analysed period,
+``TIMESTAMPTZ`` for ``created_at``, ``BOOLEAN`` for the flag. (On Postgres
+``TEXT`` and ``VARCHAR(n)`` are the same varlena type and perform identically —
+the length bound is there as a data-integrity constraint, not an optimisation.
+``DATE``/``TIMESTAMPTZ``/``BOOLEAN`` genuinely are smaller and comparable in SQL,
+which ``TEXT`` was not.)
+
+``date_key`` stays a string because it is not a date: classify writes
+``"2024-03"`` and change detection writes ``"2024-01_2025-01"``, a *pair* of
+months that no DATE column can hold. The parsed form lives alongside it in
+``period_start``/``period_end`` (end is NULL for a single-month analysis), so
+date arithmetic and range queries are still possible from SQL.
+
+Per-class classification output is normalised out of the JSON payload into
+``classification_result`` — one row per land-cover class per analysed area,
+carrying the area's centre point. That makes "what was found at this
+longitude/latitude" an indexed SQL query instead of a JSON scan.
 """
 
 from __future__ import annotations
@@ -28,7 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 logger = logging.getLogger("capstone.cache")
 
@@ -43,6 +62,14 @@ _BBOX_QUANT = 3
 CURRENT_PERIOD_TTL_DAYS = 5
 
 _TABLE = "analysis_cache"
+
+# Per-class rows lifted out of a classify payload, one per land-cover class.
+_CLASS_TABLE = "classification_result"
+
+# Longest cache_key we can produce: analysis (<=16) + date_key (<=16) + four
+# 3-decimal coordinates, plus separators. ~60 chars in practice; 160 is headroom
+# that still bounds the column.
+_CACHE_KEY_LEN = 160
 
 # Columns carried over verbatim when an old SQLite table has to be rebuilt.
 _CARRIED_COLUMNS = (
@@ -60,6 +87,15 @@ _engine_ready = False
 # Writes must then cast the JSON text explicitly (Postgres has no implicit
 # text -> jsonb assignment cast) and reads get back parsed objects, not strings.
 _json_columns = False
+
+# Same idea for the temporal columns. Values are always *bound* as ISO-8601
+# strings -- Python 3.12 deprecated sqlite3's implicit date/datetime adapters,
+# so passing native objects through raw SQL is a dead end -- and cast to the
+# real type in SQL when the column has actually been migrated. A database still
+# on the old TEXT schema keeps working: no cast is emitted, the string is stored
+# verbatim, exactly as before.
+_ts_column = False
+_date_columns = False
 
 
 # ── Key building ──────────────────────────────────────────────────────────────
@@ -105,44 +141,167 @@ def _is_postgres(engine) -> bool:
 
 
 def _create_table_sql(pg: bool) -> str:
-    """DDL for a fresh table.
+    """DDL for a fresh cache table.
 
     ``id`` is the primary key — an opaque surrogate that stays valid even if the
-    natural key ever has to change; ``cache_key`` keeps its uniqueness so the
-    lookups below are unaffected. ``longitude``/``latitude`` are the centre of
-    the analysed box, denormalised so a row can be located on a map (or matched
-    against a user's position) without re-deriving it from the four bounds.
-    created_at is stored as an ISO-8601 UTC string so we never depend on a
-    dialect's datetime binding (SQLite in particular). DOUBLE PRECISION carries
-    the real bbox for the "sub-area fully inside a computed one" lookup.
+    natural key ever has to change, and the row identity
+    ``classification_result`` points at; ``cache_key`` keeps its uniqueness so
+    the lookups below are unaffected. ``longitude``/``latitude`` are the centre
+    of the analysed box, denormalised so a row can be located on a map (or
+    matched against a user's position) without re-deriving it from the four
+    bounds. DOUBLE PRECISION carries the real bbox for the "sub-area fully
+    inside a computed one" lookup.
+
+    ``period_start``/``period_end`` are the parsed form of ``date_key`` (see the
+    module docstring). Both stay nullable: a row whose ``date_key`` cannot be
+    parsed must still be cacheable, and on an in-place migration a single
+    unparseable legacy value must not abort the whole transaction.
+
+    Every type here is chosen per dialect. SQLite has no DATE, TIMESTAMPTZ,
+    BOOLEAN or JSONB storage class, and declaring one is not harmless — a DATE
+    column takes NUMERIC affinity, which would silently truncate an ISO date.
+    So SQLite gets TEXT/INTEGER and Postgres gets the real types; only the test
+    backend is affected.
     """
     id_col = "id BIGSERIAL PRIMARY KEY" if pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
     json_type = "JSONB" if pg else "TEXT"
+    ts_type = "TIMESTAMPTZ" if pg else "TEXT"
+    bool_type = "BOOLEAN" if pg else "INTEGER"
+    # SQLite maps a DATE column to NUMERIC affinity, which truncates an ISO
+    # date at the first dash ('2024-03-01' -> 2024). TEXT is the correct SQLite
+    # storage for dates, and keeps ISO ordering intact.
+    date_type = "DATE" if pg else "TEXT"
     return f"""
     CREATE TABLE IF NOT EXISTS {_TABLE} (
         {id_col},
-        cache_key   TEXT NOT NULL UNIQUE,
-        analysis    TEXT NOT NULL,
-        date_key    TEXT NOT NULL,
-        west        DOUBLE PRECISION NOT NULL,
-        south       DOUBLE PRECISION NOT NULL,
-        east        DOUBLE PRECISION NOT NULL,
-        north       DOUBLE PRECISION NOT NULL,
-        longitude   DOUBLE PRECISION,
-        latitude    DOUBLE PRECISION,
-        is_current  INTEGER NOT NULL DEFAULT 0,
-        payload     {json_type} NOT NULL,
-        extras      {json_type},
-        created_at  TEXT NOT NULL
+        cache_key    VARCHAR({_CACHE_KEY_LEN}) NOT NULL,
+        analysis     VARCHAR(32) NOT NULL,
+        date_key     VARCHAR(32) NOT NULL,
+        period_start {date_type},
+        period_end   {date_type},
+        west         DOUBLE PRECISION NOT NULL,
+        south        DOUBLE PRECISION NOT NULL,
+        east         DOUBLE PRECISION NOT NULL,
+        north        DOUBLE PRECISION NOT NULL,
+        longitude    DOUBLE PRECISION,
+        latitude     DOUBLE PRECISION,
+        is_current   {bool_type} NOT NULL DEFAULT FALSE,
+        payload      {json_type} NOT NULL,
+        extras       {json_type},
+        created_at   {ts_type} NOT NULL,
+        -- Named table-level constraint rather than an inline UNIQUE: it is
+        -- easier to drop/recreate by name, and SQLAlchemy's SQLite reflection
+        -- only reports table-level constraints once a column type carries
+        -- parentheses, which VARCHAR(n) does.
+        CONSTRAINT uq_{_TABLE}_cache_key UNIQUE (cache_key)
     )
     """
 
 
-def _index_sql() -> str:
-    return (
-        f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_lookup "
-        f"ON {_TABLE} (analysis, date_key)"
+def _create_class_table_sql(pg: bool) -> str:
+    """DDL for the per-class classification rows.
+
+    One row per land-cover class per analysed area — four rows for a typical
+    classify (Tree/Crop/Water/Soil), so this stays small even though the parent
+    payload is large. The class breakdown already exists inside ``payload``;
+    holding it here as columns is what makes it *queryable*: "dominant class
+    near this point", "how has Water changed across periods", and so on.
+
+    ``cache_id`` is a real foreign key onto the parent's surrogate ``id``, with
+    ON DELETE CASCADE so purging a cache entry cannot leave orphans. The centre
+    point is denormalised onto each row so a point lookup is a single indexed
+    scan with no join.
+    """
+    id_col = "id BIGSERIAL PRIMARY KEY" if pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
+    return f"""
+    CREATE TABLE IF NOT EXISTS {_CLASS_TABLE} (
+        {id_col},
+        cache_id    BIGINT NOT NULL
+                    REFERENCES {_TABLE} (id) ON DELETE CASCADE,
+        class_name  VARCHAR(32) NOT NULL,
+        color       VARCHAR(7),
+        longitude   DOUBLE PRECISION,
+        latitude    DOUBLE PRECISION,
+        pixel_count INTEGER NOT NULL DEFAULT 0,
+        percent     DOUBLE PRECISION NOT NULL DEFAULT 0,
+        area_km2    DOUBLE PRECISION NOT NULL DEFAULT 0,
+        CONSTRAINT uq_{_CLASS_TABLE}_cache_class UNIQUE (cache_id, class_name)
     )
+    """
+
+
+def _index_sqls() -> list[str]:
+    """Indexes worth their write cost on these two tables.
+
+    ``lookup`` serves ``cache_get_containing``'s WHERE clause. ``centre`` and the
+    two on the child table serve the map/point queries the denormalised
+    coordinates exist for. ``cache_id`` is indexed explicitly because Postgres
+    does *not* create an index for a foreign key automatically, and the cascade
+    delete would otherwise scan the whole child table.
+    """
+    return [
+        f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_lookup "
+        f"ON {_TABLE} (analysis, date_key)",
+        f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_period "
+        f"ON {_TABLE} (period_start, period_end)",
+        f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_centre "
+        f"ON {_TABLE} (longitude, latitude)",
+        f"CREATE INDEX IF NOT EXISTS idx_{_CLASS_TABLE}_cache "
+        f"ON {_CLASS_TABLE} (cache_id)",
+        f"CREATE INDEX IF NOT EXISTS idx_{_CLASS_TABLE}_point "
+        f"ON {_CLASS_TABLE} (longitude, latitude)",
+        f"CREATE INDEX IF NOT EXISTS idx_{_CLASS_TABLE}_class "
+        f"ON {_CLASS_TABLE} (class_name)",
+    ]
+
+
+def _period_dates(date_key: str):
+    """Parse a ``date_key`` into (period_start, period_end).
+
+    ``"2024-03"`` -> (date(2024, 3, 1), None) — a single month.
+    ``"2024-01_2025-01"`` -> (date(2024, 1, 1), date(2025, 1, 1)) — a comparison.
+
+    Both are normalised to the first of the month, which is what the analysis
+    actually covers: a whole-month composite, not a specific day. Anything
+    unrecognised yields (None, None) rather than raising — the period columns
+    are a reporting convenience and must never be the reason a write fails.
+    """
+    def month_start(part: str):
+        year, month = part.split("-")
+        return date(int(year), int(month), 1)
+
+    parts = str(date_key).split("_")
+    try:
+        start = month_start(parts[0])
+        end = month_start(parts[1]) if len(parts) > 1 else None
+        return start, end
+    except (ValueError, IndexError):
+        return None, None
+
+
+def _backfill_periods(conn) -> int:
+    """Fill period_start/period_end for rows migrated from the old schema.
+
+    Done in Python rather than SQL so one implementation covers both dialects
+    (SQLite has no split_part/to_date). Returns the number of rows updated.
+    """
+    from sqlalchemy import text
+
+    rows = conn.execute(text(
+        f"SELECT id, date_key FROM {_TABLE} WHERE period_start IS NULL"
+    )).fetchall()
+
+    updated = 0
+    for row_id, date_key in rows:
+        start, end = _period_dates(date_key)
+        if start is None:
+            continue
+        conn.execute(
+            text(f"UPDATE {_TABLE} SET period_start = :s, period_end = :e WHERE id = :i"),
+            {"s": start, "e": end, "i": row_id},
+        )
+        updated += 1
+    return updated
 
 
 def _migrate_postgres(engine) -> None:
@@ -196,6 +355,48 @@ def _migrate_postgres(engine) -> None:
             stmts.append(f'ALTER TABLE {_TABLE} DROP CONSTRAINT "{pk["name"]}"')
         stmts.append(f"ALTER TABLE {_TABLE} ADD CONSTRAINT {_TABLE}_pkey PRIMARY KEY (id)")
 
+    # Task 4: narrow the identifier columns from unbounded TEXT. In Postgres this
+    # is a constraint change, not a performance one -- the two types are stored
+    # identically -- so it is safe on populated data as long as nothing exceeds
+    # the bound, which the key builder guarantees.
+    for name, length in (
+        ("cache_key", _CACHE_KEY_LEN), ("analysis", 32), ("date_key", 32),
+    ):
+        col = cols.get(name)
+        if col is not None and "VARCHAR" not in str(col["type"]).upper():
+            stmts.append(
+                f"ALTER TABLE {_TABLE} ALTER COLUMN {name} TYPE VARCHAR({length})"
+            )
+
+    # Task 5: real DATE columns for the analysed period. date_key itself stays a
+    # string because a change-detection key holds *two* months.
+    for name in ("period_start", "period_end"):
+        if name not in cols:
+            stmts.append(f"ALTER TABLE {_TABLE} ADD COLUMN {name} DATE")
+
+    # Task 6: created_at was an ISO-8601 string; every value was written by
+    # datetime.isoformat(), so the cast is total.
+    created = cols.get("created_at")
+    if created is not None and "TIMESTAMP" not in str(created["type"]).upper():
+        stmts.append(
+            f"ALTER TABLE {_TABLE} ALTER COLUMN created_at "
+            f"TYPE TIMESTAMPTZ USING created_at::timestamptz"
+        )
+
+    # Task 7: is_current is a flag, not a number.
+    flag = cols.get("is_current")
+    if flag is not None and "BOOL" not in str(flag["type"]).upper():
+        stmts.append(
+            f"ALTER TABLE {_TABLE} ALTER COLUMN is_current DROP DEFAULT"
+        )
+        stmts.append(
+            f"ALTER TABLE {_TABLE} ALTER COLUMN is_current "
+            f"TYPE BOOLEAN USING (is_current <> 0)"
+        )
+        stmts.append(
+            f"ALTER TABLE {_TABLE} ALTER COLUMN is_current SET DEFAULT FALSE"
+        )
+
     if not stmts:
         return
 
@@ -209,6 +410,9 @@ def _migrate_postgres(engine) -> None:
     with engine.begin() as conn:
         for stmt in stmts:
             conn.execute(text(stmt))
+        # Needs the period columns to exist, so it runs after the DDL above --
+        # same transaction, so a failure rolls the whole migration back.
+        _backfill_periods(conn)
     logger.info("Result cache schema migrated (%d statement(s))", len(stmts))
 
 
@@ -223,7 +427,7 @@ def _migrate_sqlite(engine) -> None:
     insp = inspect(engine)
     cols = [c["name"] for c in insp.get_columns(_TABLE)]
     pk_cols = list((insp.get_pk_constraint(_TABLE) or {}).get("constrained_columns") or [])
-    if pk_cols == ["id"] and "longitude" in cols and "latitude" in cols:
+    if pk_cols == ["id"] and {"longitude", "latitude", "period_start"} <= set(cols):
         return
 
     carried = [c for c in _CARRIED_COLUMNS if c in cols]
@@ -232,6 +436,10 @@ def _migrate_sqlite(engine) -> None:
     old = f"{_TABLE}_old"
 
     with engine.begin() as conn:
+        # The child table's rows point at ids in the table about to be dropped.
+        # It is pure derived data (rebuilt on the next write), so discard it
+        # rather than trying to remap the keys.
+        conn.execute(text(f"DROP TABLE IF EXISTS {_CLASS_TABLE}"))
         conn.execute(text(f"DROP TABLE IF EXISTS {old}"))
         conn.execute(text(f"ALTER TABLE {_TABLE} RENAME TO {old}"))
         conn.execute(text(_create_table_sql(pg=False)))
@@ -241,7 +449,53 @@ def _migrate_sqlite(engine) -> None:
         ))
         # Drops the old table's indexes too, freeing the shared index name.
         conn.execute(text(f"DROP TABLE {old}"))
+        _backfill_periods(conn)
     logger.info("Result cache schema rebuilt (SQLite)")
+
+
+def _backfill_classes(engine) -> int:
+    """Populate classification_result from payloads already in the cache.
+
+    Without this the table stays empty until every cached classify is recomputed
+    — the breakdown is already stored, just locked inside the JSON.
+
+    On Postgres only ``payload->'classes'`` is selected, never the whole payload:
+    a classify response carries two base64 PNGs, so pulling the full documents
+    for every row would move tens of megabytes to extract a few hundred bytes.
+    SQLite has no such projection, but it is the test backend with tiny rows.
+    """
+    from sqlalchemy import text
+
+    pg = _is_postgres(engine)
+    missing = (
+        f"NOT EXISTS (SELECT 1 FROM {_CLASS_TABLE} c WHERE c.cache_id = a.id)"
+    )
+    if pg:
+        sql = (
+            f"SELECT a.id, a.longitude, a.latitude, a.payload->'classes' "
+            f"FROM {_TABLE} a "
+            f"WHERE jsonb_typeof(a.payload->'classes') = 'array' AND {missing}"
+        )
+    else:
+        sql = (
+            f"SELECT a.id, a.longitude, a.latitude, a.payload "
+            f"FROM {_TABLE} a WHERE {missing}"
+        )
+
+    written = 0
+    with engine.begin() as conn:
+        for row_id, lon, lat, blob in conn.execute(text(sql)).fetchall():
+            classes = _json_load(blob)
+            if not pg:  # whole payload came back; dig out the array
+                classes = classes.get("classes") if isinstance(classes, dict) else None
+            if not isinstance(classes, list) or not classes:
+                continue
+            written += _insert_classes(
+                conn, row_id, classes,
+                lon if lon is not None else 0.0,
+                lat if lat is not None else 0.0,
+            )
+    return written
 
 
 def _init_schema(engine) -> None:
@@ -264,18 +518,40 @@ def _init_schema(engine) -> None:
         with engine.begin() as conn:
             conn.execute(text(_create_table_sql(pg)))
 
+    # The child table is additive: created whenever it is missing, including on
+    # a database whose parent table predates it.
     with engine.begin() as conn:
-        conn.execute(text(_index_sql()))
+        conn.execute(text(_create_class_table_sql(pg)))
 
-    # Whether writes need an explicit JSONB cast is read back from the database
-    # rather than assumed, so a migration that could not run still leaves a
-    # working (text-column) cache instead of failing every insert.
-    payload_type = next(
-        (str(c["type"]).upper() for c in inspect(engine).get_columns(_TABLE)
-         if c["name"] == "payload"),
-        "",
-    )
-    _json_columns = "JSON" in payload_type
+    # Indexes are created separately from the tables so that a failure to add
+    # one (e.g. a name already taken by an old schema) cannot cost us the table.
+    for stmt in _index_sqls():
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            logger.warning("Could not create index (%s)", exc)
+
+    # Lift the class breakdown out of payloads cached before this table existed.
+    # Purely derived data, so a failure here costs nothing but an emptier table.
+    try:
+        filled = _backfill_classes(engine)
+        if filled:
+            logger.info("Backfilled %d classification row(s) from cached payloads", filled)
+    except Exception as exc:  # pragma: no cover - depends on external DB
+        logger.warning("Classification backfill skipped (%s)", exc)
+
+    # Whether writes need an explicit cast is read back from the database rather
+    # than assumed, so a migration that could not run still leaves a working
+    # (text-column) cache instead of failing every insert.
+    global _ts_column, _date_columns
+    types = {
+        c["name"]: str(c["type"]).upper()
+        for c in inspect(engine).get_columns(_TABLE)
+    }
+    _json_columns = "JSON" in types.get("payload", "")
+    _ts_column = "TIMESTAMP" in types.get("created_at", "")
+    _date_columns = "DATE" in types.get("period_start", "")
 
 
 def _get_engine():
@@ -306,7 +582,7 @@ def _get_engine():
 
 def reset() -> None:
     """Test hook: drop the memoised engine so the next call rebuilds from env."""
-    global _engine, _engine_ready, _json_columns
+    global _engine, _engine_ready, _json_columns, _ts_column, _date_columns
     if _engine is not None:
         try:
             _engine.dispose()
@@ -315,6 +591,8 @@ def reset() -> None:
     _engine = None
     _engine_ready = False
     _json_columns = False
+    _ts_column = False
+    _date_columns = False
 
 
 # ── JSON column helpers ───────────────────────────────────────────────────────
@@ -336,6 +614,16 @@ def _json_load(value):
 def _json_param(name: str) -> str:
     """Bind-parameter expression for a JSON column."""
     return f"CAST(:{name} AS JSONB)" if _json_columns else f":{name}"
+
+
+def _ts_param(name: str) -> str:
+    """Bind-parameter expression for the created_at column."""
+    return f"CAST(:{name} AS TIMESTAMPTZ)" if _ts_column else f":{name}"
+
+
+def _date_param(name: str) -> str:
+    """Bind-parameter expression for a period_* column."""
+    return f"CAST(:{name} AS DATE)" if _date_columns else f":{name}"
 
 
 # ── Freshness ─────────────────────────────────────────────────────────────────
@@ -385,12 +673,84 @@ def cache_get(analysis: str, date_key: str, bbox, is_current: bool):
 
         data = _json_load(payload_value)
         data["cached"] = True
-        data["cachedAt"] = str(created_at)
+        # Postgres now hands back a datetime (TIMESTAMPTZ); SQLite still returns
+        # the ISO string it stored. Normalise so the client sees one format.
+        data["cachedAt"] = (
+            created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
+        )
         logger.info("Cache HIT: %s", key)
         return data
     except Exception as exc:  # pragma: no cover - depends on external DB
         logger.warning("Cache read failed (%s) — computing fresh", exc)
         return None
+
+
+def _store_classes(conn, cache_key: str, payload, lon: float, lat: float) -> int:
+    """Normalise a classify payload's ``classes`` array into ``classification_result``.
+
+    Runs inside the caller's transaction, on the connection that just inserted
+    the parent row. A payload without a well-formed ``classes`` array (change
+    detection, an error response, an old cached shape) simply writes nothing.
+
+    The parent id is re-read by ``cache_key`` rather than captured from the
+    INSERT: ``RETURNING`` is Postgres-only and ``lastrowid`` is SQLite-only, and
+    a cache write happens once per expensive analysis, so the extra round trip
+    is free next to the Sentinel Hub fetch it follows.
+    """
+    from sqlalchemy import text
+
+    rows = payload.get("classes") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return 0
+
+    cache_id = conn.execute(
+        text(f"SELECT id FROM {_TABLE} WHERE cache_key = :k"), {"k": cache_key},
+    ).scalar()
+    if cache_id is None:  # pragma: no cover - parent was just inserted
+        return 0
+
+    return _insert_classes(conn, cache_id, rows, lon, lat)
+
+
+def _insert_classes(conn, cache_id, rows, lon: float, lat: float) -> int:
+    """Write one child row per well-formed class entry. Returns how many landed.
+
+    Entries are truncated to the column widths rather than rejected: a payload
+    is data we already returned to a client, so a surprising value should cost
+    at most one malformed cache row, never the write.
+    """
+    from sqlalchemy import text
+
+    written = 0
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        try:
+            pixels = int(entry.get("pixels") or 0)
+            percent = float(entry.get("percent") or 0.0)
+            area = float(entry.get("areaKm2") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        conn.execute(
+            text(
+                f"INSERT INTO {_CLASS_TABLE} "
+                f"(cache_id, class_name, color, longitude, latitude, "
+                f" pixel_count, percent, area_km2) "
+                f"VALUES (:cid, :n, :c, :lon, :lat, :px, :pct, :area)"
+            ),
+            {
+                "cid": cache_id,
+                "n": str(name)[:32],
+                "c": str(entry.get("color") or "")[:7] or None,
+                "lon": lon, "lat": lat,
+                "px": pixels, "pct": percent, "area": area,
+            },
+        )
+        written += 1
+    return written
 
 
 def cache_put(
@@ -417,6 +777,7 @@ def cache_put(
     key = make_key(analysis, date_key, bbox)
     w, s, e, n = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
     lon, lat = (w + e) / 2.0, (s + n) / 2.0
+    period_start, period_end = _period_dates(date_key)
     try:
         body = json.dumps(payload, separators=(",", ":"))
         extras_body = json.dumps(extras, separators=(",", ":")) if extras is not None else None
@@ -430,24 +791,40 @@ def cache_put(
         # Portable upsert: delete-then-insert in one transaction avoids the
         # dialect gap between Postgres ON CONFLICT and SQLite's UPSERT.
         with engine.begin() as conn:
+            # Child rows go first and explicitly: ON DELETE CASCADE handles this
+            # on Postgres, but SQLite only enforces foreign keys when the
+            # per-connection `PRAGMA foreign_keys` is on, which it is not by
+            # default. Deleting here is correct on both.
+            conn.execute(
+                text(
+                    f"DELETE FROM {_CLASS_TABLE} WHERE cache_id IN "
+                    f"(SELECT id FROM {_TABLE} WHERE cache_key = :k)"
+                ),
+                {"k": key},
+            )
             conn.execute(text(f"DELETE FROM {_TABLE} WHERE cache_key = :k"), {"k": key})
             conn.execute(
                 text(
                     f"INSERT INTO {_TABLE} "
-                    f"(cache_key, analysis, date_key, west, south, east, north, "
+                    f"(cache_key, analysis, date_key, period_start, period_end, "
+                    f" west, south, east, north, "
                     f" longitude, latitude, is_current, payload, extras, created_at) "
-                    f"VALUES (:k, :a, :d, :w, :s, :e, :n, :lon, :lat, :cur, "
-                    f"{_json_param('p')}, {_json_param('x')}, :ts)"
+                    f"VALUES (:k, :a, :d, {_date_param('ps')}, {_date_param('pe')}, "
+                    f":w, :s, :e, :n, :lon, :lat, :cur, "
+                    f"{_json_param('p')}, {_json_param('x')}, {_ts_param('ts')})"
                 ),
                 {
                     "k": key, "a": analysis, "d": date_key,
+                    "ps": period_start.isoformat() if period_start else None,
+                    "pe": period_end.isoformat() if period_end else None,
                     "w": w, "s": s, "e": e, "n": n,
                     "lon": lon, "lat": lat,
-                    "cur": 1 if is_current else 0,
+                    "cur": bool(is_current),
                     "p": body, "x": extras_body,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 },
             )
+            _store_classes(conn, key, payload, lon, lat)
         logger.info("Cache STORE: %s (%d bytes)", key, len(body))
     except Exception as exc:  # pragma: no cover - depends on external DB
         logger.warning("Cache write failed (%s) — response still returned", exc)

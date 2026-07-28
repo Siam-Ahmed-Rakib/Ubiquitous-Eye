@@ -130,6 +130,122 @@ def test_centre_longitude_latitude_are_stored(sqlite_cache):
     assert lat == pytest.approx(23.8)
 
 
+# ── Typed period columns ──────────────────────────────────────────────────────
+
+def test_period_dates_parses_both_key_shapes():
+    """date_key is a string because it holds one month *or* two; both parse."""
+    from datetime import date
+
+    assert cache._period_dates("2024-03") == (date(2024, 3, 1), None)
+    assert cache._period_dates("2024-01_2025-01") == (date(2024, 1, 1), date(2025, 1, 1))
+
+    # Unparseable input must not raise — the period columns are a convenience.
+    assert cache._period_dates("not-a-date") == (None, None)
+    assert cache._period_dates("") == (None, None)
+
+
+def test_period_columns_are_stored_for_both_analyses(sqlite_cache):
+    bbox = (90.0, 23.7, 90.2, 23.9)
+    cache.cache_put("classify", "2024-03", bbox, False, {"v": 1})
+    cache.cache_put("analyze_v4", "2024-01_2025-01", bbox, False, {"v": 2})
+
+    with cache._get_engine().connect() as conn:
+        rows = dict(conn.execute(text(
+            f"SELECT analysis, period_start || '/' || COALESCE(period_end, '-') "
+            f"FROM {cache._TABLE}"
+        )).fetchall())
+
+    # A single-month classify has no end; change detection carries both months.
+    assert rows["classify"] == "2024-03-01/-"
+    assert rows["analyze_v4"] == "2024-01-01/2025-01-01"
+
+
+# ── Normalised classification rows ────────────────────────────────────────────
+
+_CLASSES = [
+    {"name": "Tree", "color": "#2E7D32", "pixels": 120, "percent": 60.0, "areaKm2": 1.2},
+    {"name": "Water", "color": "#1565C0", "pixels": 80, "percent": 40.0, "areaKm2": 0.8},
+]
+
+
+def test_classes_are_normalised_into_their_own_table(sqlite_cache):
+    """The class breakdown becomes queryable rows, not just JSON in the payload."""
+    cache.cache_put("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), False,
+                    {"status": "success", "classes": _CLASSES})
+
+    engine = cache._get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT class_name, color, longitude, latitude, pixel_count, percent, area_km2 "
+            f"FROM {cache._CLASS_TABLE} ORDER BY percent DESC"
+        )).fetchall()
+
+    assert [r[0] for r in rows] == ["Tree", "Water"]
+    assert rows[0][1] == "#2E7D32"
+    # Each row carries the analysed area's centre, so a point lookup needs no join.
+    assert rows[0][2] == pytest.approx(90.1)
+    assert rows[0][3] == pytest.approx(23.8)
+    assert (rows[0][4], rows[0][5], rows[0][6]) == (120, 60.0, 1.2)
+
+    # id is the primary key here too, and cache_id is a real foreign key.
+    insp = inspect(engine)
+    assert insp.get_pk_constraint(cache._CLASS_TABLE)["constrained_columns"] == ["id"]
+    fk = insp.get_foreign_keys(cache._CLASS_TABLE)[0]
+    assert fk["constrained_columns"] == ["cache_id"]
+    assert fk["referred_table"] == cache._TABLE
+    assert fk["referred_columns"] == ["id"]
+
+
+def test_classes_are_replaced_when_an_entry_is_overwritten(sqlite_cache):
+    bbox = (90.0, 23.7, 90.2, 23.9)
+    cache.cache_put("classify", "2024-03", bbox, False,
+                    {"status": "success", "classes": _CLASSES})
+    cache.cache_put("classify", "2024-03", bbox, False, {"status": "success", "classes": [
+        {"name": "Soil", "color": "#A1887F", "pixels": 200, "percent": 100.0, "areaKm2": 2.0},
+    ]})
+
+    with cache._get_engine().connect() as conn:
+        names = [r[0] for r in conn.execute(
+            text(f"SELECT class_name FROM {cache._CLASS_TABLE}")
+        )]
+    assert names == ["Soil"], "stale child rows must not survive an overwrite"
+
+
+def test_payload_without_classes_writes_no_child_rows(sqlite_cache):
+    """Change detection has no class breakdown; that is not an error."""
+    cache.cache_put("analyze_v4", "2024-01_2025-01", (90.0, 23.7, 90.2, 23.9), False,
+                    {"status": "success"})
+
+    with cache._get_engine().connect() as conn:
+        n = conn.execute(text(f"SELECT COUNT(*) FROM {cache._CLASS_TABLE}")).scalar()
+    assert n == 0
+
+
+def test_classes_are_backfilled_from_already_cached_payloads(tmp_path, monkeypatch):
+    """A payload cached before the table existed still yields its class rows."""
+    db_path = tmp_path / "backfill.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    cache.reset()
+    try:
+        cache.cache_put("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), False,
+                        {"status": "success", "classes": _CLASSES})
+        # Drop the derived table, as if this database predated it.
+        with cache._get_engine().begin() as conn:
+            conn.execute(text(f"DROP TABLE {cache._CLASS_TABLE}"))
+        cache.reset()
+
+        # Re-opening recreates it and repopulates from the stored payload.
+        cache.cache_get("classify", "2024-03", (90.0, 23.7, 90.2, 23.9), is_current=False)
+        with cache._get_engine().connect() as conn:
+            names = {r[0] for r in conn.execute(
+                text(f"SELECT class_name FROM {cache._CLASS_TABLE}")
+            )}
+        assert names == {"Tree", "Water"}
+    finally:
+        cache.reset()
+
+
 def test_old_schema_is_migrated_in_place(tmp_path, monkeypatch):
     """A table written by the previous version keeps its rows and gains the new shape."""
     from sqlalchemy import create_engine
@@ -181,7 +297,19 @@ def test_old_schema_is_migrated_in_place(tmp_path, monkeypatch):
         insp = inspect(engine)
         assert insp.get_pk_constraint(cache._TABLE)["constrained_columns"] == ["id"]
         cols = {c["name"] for c in insp.get_columns(cache._TABLE)}
-        assert {"id", "longitude", "latitude"} <= cols
+        assert {"id", "longitude", "latitude", "period_start", "period_end"} <= cols
+
+        # The identifier columns are bounded rather than unbounded TEXT.
+        types = {c["name"]: str(c["type"]).upper() for c in insp.get_columns(cache._TABLE)}
+        for name in ("cache_key", "analysis", "date_key"):
+            assert "VARCHAR" in types[name], f"{name} should be bounded, got {types[name]}"
+
+        # The legacy row's date_key is parsed into the typed period column.
+        with engine.connect() as conn:
+            start, end = conn.execute(
+                text(f"SELECT period_start, period_end FROM {cache._TABLE}")
+            ).fetchone()
+        assert str(start) == "2024-03-01" and end is None
 
         # The legacy row is backfilled with its centre point.
         with engine.connect() as conn:
