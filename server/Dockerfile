@@ -26,6 +26,17 @@ COPY server/cache.py ./
 COPY server/inference/ ./inference/
 COPY --from=frontend-builder /app/Frontend/dist /app/frontend_dist
 
+# Managed hosts tell the container which port to listen on via $PORT
+# (Hugging Face Spaces, Cloud Run, Railway). Default keeps local compose at 5000.
+ENV PORT=5000
+
 EXPOSE 5000
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "300", "api_server:app"]
+# sh -c so ${PORT}/${WEB_CONCURRENCY} expand at runtime; exec so gunicorn
+# replaces the shell as PID 1 and still receives SIGTERM for graceful shutdown.
+#
+# --preload imports the app once in the master before forking, so the ~225 MB of
+# numpy/sklearn/xgboost/catboost is shared copy-on-write instead of paid per
+# worker. This is only safe because cache.py builds its SQLAlchemy engine lazily,
+# after the fork -- preloading an open connection pool corrupts shared sockets.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT} --workers ${WEB_CONCURRENCY:-2} --threads 4 --timeout 300 --preload api_server:app"]

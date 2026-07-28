@@ -1,13 +1,35 @@
-flask>=3.0.0
-flask-cors>=4.0.0
-sentinelhub>=3.10.0
-gunicorn>=22.0.0
-pandas>=2.0.0
-scipy>=1.11.0
-scikit-learn>=1.3.0
-joblib>=1.3.0
-xgboost>=2.0.0
-catboost>=1.2.0
-lightgbm>=4.0.0
-SQLAlchemy>=2.0.0
-psycopg2-binary>=2.9.0
+# Versions are pinned exactly, not floored with >=.
+#
+# Why: the model artifacts in inference/capstone_model_v2/ are pickles, and
+# pickles are tied to the library version that wrote them. With >= ranges, a
+# rebuild on a new host resolves to whatever is newest that day, so the same
+# commit can produce a different image next week and the models may load
+# wrong -- or silently mispredict -- with no code change to blame.
+#
+# These are the versions currently running and passing the test suite.
+# To upgrade, bump deliberately and re-run the tests.
+
+Flask==3.1.3
+flask-cors==6.0.5
+gunicorn==26.0.0
+
+# Imported directly by api_server.py, so pinned as first-class deps rather
+# than left to float as transitive ones. numpy especially: the 1.x -> 2.x
+# break changes pickle compatibility.
+numpy==2.5.1
+pillow==12.3.0
+pandas==3.0.3
+scipy==1.18.0
+
+# Model stack. See the note above about pickle/version coupling.
+scikit-learn==1.9.0
+joblib==1.5.3
+xgboost==3.3.0
+catboost==1.2.10
+lightgbm==4.7.0
+
+sentinelhub==3.11.5
+
+# Result cache.
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
