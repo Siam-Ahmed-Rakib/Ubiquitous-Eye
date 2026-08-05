@@ -1,0 +1,60 @@
+# Docker reads .dockerignore only from the build context root. Both compose
+# services build with `context: .`, so this is the only one that takes effect.
+# Frontend/.dockerignore and server/.dockerignore sit *below* the context root
+# and are silently never read -- which is why GRANULE and node_modules were
+# still being sent despite both being listed there.
+#
+# Context before this file existed: 324 MB. The two images need under 10 MB.
+#
+# Note this does not affect compose's own `.env` lookup: docker-compose reads
+# ./.env from the host to interpolate ${SH_CLIENT_ID} etc., which happens
+# before and outside the build context.
+
+# Version control and local tool state. .claude/ holds worktrees -- complete
+# copies of this repo, model artifacts and all.
+.git/
+.gitignore
+.claude/
+
+# The Flutter client is not part of either image.
+mobile/
+
+# Sentinel SCL scratch, 90 MB of which is one generated CSV. api_server.py
+# treats server/GRANULE as a write-only output directory and recreates it at
+# runtime via mkdir(parents=True, exist_ok=True), so nothing needs it baked in.
+server/GRANULE/
+
+# Duplicate of server/inference/, which is the copy server/Dockerfile installs.
+inference/
+
+# Secrets. Neither Dockerfile COPYs these today, but keeping them out of the
+# context means a future broad COPY cannot bake one into a published layer.
+# Vite in particular inlines any VITE_* var into the public JS bundle.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Python artefacts. Tests are docker cp'd into the container, never built in.
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+**/.pytest_cache/
+.venv/
+server/tests/
+
+# npm ci reinstalls these inside the builder stage; copying a host node_modules
+# over that result is both slow and wrong (host is Windows, image is Alpine).
+**/node_modules/
+
+# Produced by `npm run build` inside the image; a host copy would be discarded.
+Frontend/dist/
+
+# Docs and compose config are never COPYed by either Dockerfile.
+*.md
+**/*.md
+docker-compose.yml
+docker-compose.override.yml
