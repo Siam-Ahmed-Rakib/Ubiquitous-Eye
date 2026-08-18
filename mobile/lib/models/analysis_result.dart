@@ -4,10 +4,24 @@ import 'package:flutter/material.dart';
 import 'package:latlong2/latlong.dart';
 
 import 'area_bounds.dart';
+import 'land_use_result.dart';
 
 /// Colour per `mask` value, matching `CHANGE_COLORS` in `server/api_server.py`.
 const Color kDeforestationColor = Color(0xFFE53935); // mask 1 — vegetation loss
 const Color kWaterLossColor = Color(0xFFFB8C00); // mask 2 — surface-water loss
+
+/// The three ground types the before/after class map paints, in the order a
+/// legend should list them.
+///
+/// Each colour is the *mid* stop of that class's ramp in `CLASS_MAP_RAMPS`
+/// (`server/api_server.py`) — the rendered map shades darker and lighter around
+/// it with the scene's own brightness, so this is the colour that represents the
+/// class rather than one the raster necessarily contains.
+const Map<String, Color> kClassMapPalette = {
+  'Tree': Color(0xFF2D7D32),
+  'Water': Color(0xFF1565C0),
+  'Soil': Color(0xFFB08968),
+};
 
 /// A single changed pixel from the backend change-detection pipeline.
 ///
@@ -76,6 +90,20 @@ class AnalysisResult {
   final Uint8List? oldImagePng;
   final Uint8List? newImagePng;
 
+  /// Each date's land cover painted as a picture: every cell coloured by what
+  /// the classifier called it (green tree, blue water, tan soil), shaded by the
+  /// scene's own brightness and outlined where two classes meet.
+  ///
+  /// The same grid and bounds as the scenes above, so a pane can swap between
+  /// raw imagery and its class map without anything moving.
+  final Uint8List? oldClassPng;
+  final Uint8List? newClassPng;
+
+  /// What each date is made of, largest share first. Empty when the backend
+  /// could not report it — a cached sub-area, or an older server.
+  final List<LandCoverClass> oldClasses;
+  final List<LandCoverClass> newClasses;
+
   /// One raster per change class, so each can be toggled on its own.
   final Uint8List? deforestationPng;
   final Uint8List? waterLossPng;
@@ -94,6 +122,10 @@ class AnalysisResult {
     required this.stats,
     this.oldImagePng,
     this.newImagePng,
+    this.oldClassPng,
+    this.newClassPng,
+    this.oldClasses = const [],
+    this.newClasses = const [],
     this.deforestationPng,
     this.waterLossPng,
     this.imageWidth = 0,
@@ -113,6 +145,15 @@ class AnalysisResult {
 
   /// Whether both dates' scenes came back, so a before/after view is possible.
   bool get hasComparisonImagery => oldImagePng != null && newImagePng != null;
+
+  /// Whether both dates' class maps came back, so the land-cover toggle has
+  /// something to switch to. Independent of [hasComparisonImagery]: either can
+  /// arrive without the other.
+  bool get hasClassMaps => oldClassPng != null && newClassPng != null;
+
+  /// Whether a changed-pixel raster exists to draw the difference view from.
+  bool get hasChangeRasters =>
+      deforestationPng != null || waterLossPng != null;
 
   /// Shape of the rasters. Guarded so a malformed response can't divide by zero.
   double get aspectRatio =>

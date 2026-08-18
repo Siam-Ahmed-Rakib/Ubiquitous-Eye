@@ -111,6 +111,106 @@ const fmtBytes = (b) =>
       ? (b / 1024).toFixed(1) + " KB"
       : (b / 1048576).toFixed(2) + " MB";
 
+/* ── Change-mask rendering ─────────────────────────────────────────────────
+   The analysis returns one changed pixel per record. Drawing those as markers
+   turns a solid patch of clearing into a scatter of dots that reads as noise,
+   so the mask is instead painted as a raster covering the whole analysed box
+   and stretched onto it — the same way the backend's own mask PNGs are drawn.
+   Nothing is smoothed, hulled or bounding-boxed: a patch keeps the ragged,
+   spiky outline the classifier actually produced. */
+
+const CHANGE_CLASSES = [
+  { mask: 1, key: "deforestation", label: "Deforestation", color: "#E53935" },
+  { mask: 2, key: "waterLoss", label: "Water loss", color: "#FB8C00" },
+];
+
+/** Longest side of a client-painted mask, in cells. */
+const MASK_MAX_PX = 2048;
+
+/** Cells per side when the pixel grid can't be read off the data — a result
+    with a single changed pixel, say. Only the cell size is a guess; erring fine
+    keeps that pixel a speck rather than inflating it into a slab of the map. */
+const MASK_FALLBACK_CELLS = 512;
+
+/** Smallest positive gap between consecutive unique values — the grid pitch. */
+const inferPitch = (values) => {
+  const uniq = Array.from(new Set(values)).sort((a, b) => a - b);
+  let pitch = Infinity;
+  for (let i = 1; i < uniq.length; i++) {
+    const d = uniq[i] - uniq[i - 1];
+    if (d > 1e-9 && d < pitch) pitch = d;
+  }
+  return Number.isFinite(pitch) ? pitch : 0;
+};
+
+/**
+ * Paint one change class into a transparent raster spanning `box`.
+ *
+ * Only used when the backend returned no mask PNG for the class (an older
+ * server, or an imagery fetch that failed). Cell size comes from the spacing
+ * the points themselves sit on, so neighbouring changed pixels land in
+ * neighbouring cells and meet edge to edge — the patch fills solid rather than
+ * breaking into dots, and its border stays exactly as jagged as the data.
+ *
+ * The spacing is read from *every* changed pixel, not just this class's: both
+ * classes were sampled off one grid, and a class holding a single pixel has no
+ * spacing of its own to measure.
+ *
+ * Returns a PNG data URL, or null when the class has no pixels.
+ */
+const rasterizeChanges = (changes, box, maskValue, color) => {
+  const pts = changes.filter((c) => c.mask === maskValue);
+  if (!pts.length) return null;
+
+  const lonSpan = box.east - box.west || 1e-9;
+  const latSpan = box.north - box.south || 1e-9;
+
+  const lonPitch =
+    inferPitch(changes.map((p) => p.Longitude)) || lonSpan / MASK_FALLBACK_CELLS;
+  const latPitch =
+    inferPitch(changes.map((p) => p.Latitude)) || latSpan / MASK_FALLBACK_CELLS;
+
+  const clampSize = (n) => Math.max(1, Math.min(MASK_MAX_PX, Math.round(n)));
+  const width = clampSize(lonSpan / lonPitch + 1);
+  const height = clampSize(latSpan / latPitch + 1);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(width, height);
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
+
+  for (const p of pts) {
+    const col = Math.round(((p.Longitude - box.west) / lonSpan) * (width - 1));
+    const row = Math.round(((box.north - p.Latitude) / latSpan) * (height - 1));
+    if (col < 0 || col >= width || row < 0 || row >= height) continue;
+    const o = (row * width + col) * 4;
+    img.data[o] = r;
+    img.data[o + 1] = g;
+    img.data[o + 2] = b;
+    img.data[o + 3] = 255;
+  }
+
+  ctx.putImageData(img, 0, 0);
+  return canvas.toDataURL("image/png");
+};
+
+/** The analysed box, from the response or — on an older backend — the points. */
+const changeBox = (data) => {
+  if (data.bounds) return data.bounds;
+  const pts = data.changes || [];
+  if (!pts.length) return null;
+  const lons = pts.map((p) => p.Longitude);
+  const lats = pts.map((p) => p.Latitude);
+  return {
+    west: Math.min(...lons),
+    east: Math.max(...lons),
+    south: Math.min(...lats),
+    north: Math.max(...lats),
+  };
+};
+
 export default function MapView({ analysisType, onBack }) {
   const mapElRef = useRef(null);
   const mapRef = useRef(null);
@@ -146,7 +246,12 @@ export default function MapView({ analysisType, onBack }) {
     setTimeout(() => setToast(null), ms);
   }, []);
 
-  const overlayRef = useRef(null);
+  /* Everything needed to draw the change mask, kept apart from the stats so the
+     visibility controls below can redraw without re-running the analysis. */
+  const [overlay, setOverlay] = useState(null);
+  const [maskOpacity, setMaskOpacity] = useState(0.85);
+  const [showClass, setShowClass] = useState({ deforestation: true, waterLoss: true });
+  const [showScene, setShowScene] = useState(true);
 
   const sendToBackend = useCallback(async (layer) => {
     if (analyzing) return;
@@ -176,12 +281,7 @@ export default function MapView({ analysisType, onBack }) {
 
     setAnalyzing(true);
     setAnalysisResult(null);
-
-    // Clear previous overlay
-    if (overlayRef.current && mapRef.current) {
-      mapRef.current.removeLayer(overlayRef.current);
-      overlayRef.current = null;
-    }
+    setOverlay(null);
 
     pushToast("Running full analysis pipeline...", "info", 6000);
 
@@ -215,23 +315,32 @@ export default function MapView({ analysisType, onBack }) {
         ts: new Date().toISOString(),
       });
 
-      // Render overlay on map
-      if (data.changes && data.changes.length > 0 && mapRef.current) {
-        const overlayGroup = L.layerGroup();
-        data.changes.forEach((pt) => {
-          const color = pt.mask === 1 ? "#ff0000" : "#ff8c00";
-          const fillColor = pt.mask === 1 ? "rgba(255,0,0,0.5)" : "rgba(255,140,0,0.5)";
-          L.circleMarker([pt.Latitude, pt.Longitude], {
-            radius: 3,
-            color: color,
-            weight: 0.5,
-            fillColor: fillColor,
-            fillOpacity: 0.6,
-          }).addTo(overlayGroup);
-        });
-        overlayGroup.addTo(mapRef.current);
-        overlayRef.current = overlayGroup;
+      // Render the mask as rasters covering the whole analysed box. The backend
+      // already ships one PNG per class; painting them here is only the fallback
+      // for a response that carries none.
+      const box = changeBox(data);
+      if (box && mapRef.current) {
+        const png = (b64) => (b64 ? `data:image/png;base64,${b64}` : null);
+        const changes = Array.isArray(data.changes) ? data.changes : [];
+        const bounds = L.latLngBounds(
+          L.latLng(box.south, box.west),
+          L.latLng(box.north, box.east),
+        );
 
+        const masks = {};
+        for (const c of CHANGE_CLASSES) {
+          masks[c.key] =
+            png(data[`${c.key}PngBase64`]) ||
+            rasterizeChanges(changes, box, c.mask, c.color);
+        }
+
+        const sceneUrl = png(data.newImagePngBase64);
+        setShowScene(Boolean(sceneUrl));
+        setOverlay({ bounds, sceneUrl, masks });
+        mapRef.current.fitBounds(bounds, { padding: [40, 40] });
+      }
+
+      if (data.changes && data.changes.length > 0) {
         pushToast(
           `Analysis complete: ${data.stats.deforestation} deforestation, ${data.stats.waterLoss} water loss pixels`,
           "success",
@@ -451,6 +560,37 @@ export default function MapView({ analysisType, onBack }) {
     };
   }, [analysisType]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  /* ── Draw the change mask ────────────────────────────────── */
+  /* Rebuilt from `overlay` whenever the visibility controls move, so toggling a
+     class or dragging the opacity slider never re-runs the analysis. */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !overlay) return;
+
+    const group = L.layerGroup();
+    const addRaster = (url, opacity, className) => {
+      if (!url) return;
+      L.imageOverlay(url, overlay.bounds, {
+        opacity,
+        className,
+        interactive: false,
+      }).addTo(group);
+    };
+
+    // The scene the classification was computed from, so the mask sits on the
+    // ground it describes rather than on a basemap from another date.
+    if (showScene) addRaster(overlay.sceneUrl, 1, "mv-scene-raster");
+    // Water loss first, so red wins wherever the two classes touch. Both go on
+    // with nearest-neighbour sampling — see .mv-mask-raster.
+    if (showClass.waterLoss)
+      addRaster(overlay.masks.waterLoss, maskOpacity, "mv-mask-raster");
+    if (showClass.deforestation)
+      addRaster(overlay.masks.deforestation, maskOpacity, "mv-mask-raster");
+
+    group.addTo(map);
+    return () => map.removeLayer(group);
+  }, [overlay, maskOpacity, showClass, showScene]);
+
   /* ── Tile switcher ───────────────────────────────────────── */
   const switchTile = useCallback((id) => {
     if (!mapRef.current || !tileRef.current) return;
@@ -485,6 +625,8 @@ export default function MapView({ analysisType, onBack }) {
     drawnRef.current?.clearLayers();
     setSel(null);
     setResult(null);
+    setOverlay(null);
+    setAnalysisResult(null);
   }, []);
 
   const activateDraw = useCallback(() => {
@@ -1068,16 +1210,56 @@ export default function MapView({ analysisType, onBack }) {
                       <span className="mv-meta-k" style={{ fontSize: "11px" }}>Total Pixels</span>
                       <span className="mv-meta-v" style={{ fontSize: "11px" }}>{analysisResult.stats.totalPixels}</span>
                     </div>
-                    <div style={{ marginTop: "8px", display: "flex", gap: "10px", fontSize: "10px" }}>
-                      <span style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                        <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#ef4444", display: "inline-block" }} />
-                        Deforestation
-                      </span>
-                      <span style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                        <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "#f97316", display: "inline-block" }} />
-                        Water Loss
-                      </span>
-                    </div>
+                    {overlay && (
+                      <div className="mv-mask-ctl">
+                        <div className="mv-mask-ctl-h">Mask</div>
+
+                        {CHANGE_CLASSES.map((c) => (
+                          <label key={c.key} className="mv-mask-row">
+                            <input
+                              type="checkbox"
+                              checked={showClass[c.key]}
+                              disabled={!overlay.masks[c.key]}
+                              onChange={(e) =>
+                                setShowClass((s) => ({ ...s, [c.key]: e.target.checked }))
+                              }
+                            />
+                            <span
+                              className="mv-mask-swatch"
+                              style={{ background: c.color }}
+                            />
+                            {c.label}
+                          </label>
+                        ))}
+
+                        {overlay.sceneUrl && (
+                          <label className="mv-mask-row">
+                            <input
+                              type="checkbox"
+                              checked={showScene}
+                              onChange={(e) => setShowScene(e.target.checked)}
+                            />
+                            <span className="mv-mask-swatch mv-mask-swatch--scene" />
+                            Analysed scene
+                          </label>
+                        )}
+
+                        <div className="mv-mask-row">
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.05"
+                            value={maskOpacity}
+                            onChange={(e) => setMaskOpacity(parseFloat(e.target.value))}
+                            style={{ flex: 1 }}
+                          />
+                          <span className="mv-mask-pct">
+                            {Math.round(maskOpacity * 100)}%
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

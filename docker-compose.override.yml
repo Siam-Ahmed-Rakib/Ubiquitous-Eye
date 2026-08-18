@@ -7,3 +7,14 @@ services:
   backend:
     ports: !override
       - "5001:5000"
+
+  # Host port 8080 is taken by another project too (a WordPress stack), so the
+  # site is served on 8081. Container-side is still 80. BACKEND_URL is baked
+  # into the JS bundle at build time, so it has to match the host-side
+  # backend port above (5001), not the in-container one.
+  frontend:
+    build:
+      args:
+        BACKEND_URL: http://localhost:5001
+    ports: !override
+      - "8081:80"

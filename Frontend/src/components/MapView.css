@@ -560,6 +560,77 @@
     letter-spacing: -0.01em;
 }
 
+/* ── Change mask ──────────────────────────────────────────── */
+/* A mask cell is a measurement, not a photograph: nearest-neighbour keeps the
+   ragged class boundaries the classifier drew instead of feathering them into a
+   smooth edge. */
+.mv-mask-raster {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+/* The scene under the mask is a photograph, so it keeps the browser's default
+   smoothing — only the mask must stay hard-edged. */
+.mv-scene-raster {
+    image-rendering: auto;
+}
+
+.mv-mask-ctl {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.mv-mask-ctl-h {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.mv-mask-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.mv-mask-row:has(input:disabled) {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.mv-mask-row input[type="checkbox"] {
+    accent-color: var(--text-secondary);
+    cursor: inherit;
+}
+
+.mv-mask-swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+    display: inline-block;
+    flex: none;
+}
+
+.mv-mask-swatch--scene {
+    background: linear-gradient(135deg, #2f4f2a, #8aa07a);
+}
+
+.mv-mask-pct {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    font-family: "JetBrains Mono", monospace;
+    width: 34px;
+    text-align: right;
+}
+
 /* ── Toast notification ───────────────────────────────────── */
 .mv-toast {
     position: fixed;

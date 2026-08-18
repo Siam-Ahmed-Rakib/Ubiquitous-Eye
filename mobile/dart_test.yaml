@@ -1,0 +1,9 @@
+# `preview` renders the before/after view to PNGs in build/preview/ for design
+# review. It writes files rather than asserting anything, so it is skipped by
+# default and opted into explicitly (`--tags` does not override `skip`, so the
+# opt-in is `--run-skipped`):
+#
+#   flutter test --run-skipped --update-goldens test/before_after_preview_test.dart
+tags:
+  preview:
+    skip: "design preview — run with --run-skipped --update-goldens"

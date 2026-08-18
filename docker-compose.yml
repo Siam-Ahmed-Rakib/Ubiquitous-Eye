@@ -20,10 +20,30 @@ services:
   frontend:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: mobile.Dockerfile
+      args:
+        # Baked into the JS bundle at build time; must be reachable from the
+        # browser. Matches the backend port mapping below (5000:5000).
+        BACKEND_URL: http://localhost:5000
     container_name: capstone-frontend
     depends_on:
       - backend
     ports:
       - "8080:80"
     restart: unless-stopped
+
+  # The original React frontend. Not started by `docker compose up` (it's
+  # gated behind the "react" profile) -- run `docker compose --profile react
+  # up frontend-react` to bring it up alongside/instead of the Flutter one.
+  frontend-react:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: capstone-frontend-react
+    depends_on:
+      - backend
+    ports:
+      - "8082:80"
+    restart: unless-stopped
+    profiles:
+      - react

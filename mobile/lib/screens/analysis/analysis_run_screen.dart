@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 
@@ -5,8 +7,10 @@ import '../../models/analytics_service.dart';
 import '../../models/analysis_result.dart';
 import '../../models/area_bounds.dart';
 import '../../services/analysis_service.dart';
+import '../../util/change_raster.dart';
 import '../../util/responsive.dart';
 import '../../widgets/before_after_compare.dart';
+import '../../widgets/change_mask_layer.dart';
 import '../../widgets/map_gestures.dart';
 import '../../widgets/map_zoom_controls.dart';
 import '../../widgets/month_year_field.dart';
@@ -22,8 +26,8 @@ const Color _waterColor = kWaterLossColor; // mask 2 — surface-water loss
 enum _ResultView { compare, map }
 
 /// Runs the backend change-detection pipeline over a selected area and shows
-/// the result: changed pixels drawn on the map (red = deforestation,
-/// orange = water loss) plus summary statistics.
+/// the result: a mask covering the whole analysed area, painted over the map
+/// (red = deforestation, orange = water loss), plus summary statistics.
 ///
 /// Reached from the "New Image" flow (generic) and from the Analytics flow
 /// (with a [service] for context/title).
@@ -43,10 +47,12 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
   static const String _labelsUrl =
       'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
 
-  static const int _maxRenderPoints = 6000;
-
   static const double _minZoom = 2;
   static const double _maxZoom = 18;
+
+  /// How strongly the mask is painted over the basemap. High enough to read the
+  /// shape of a change at a glance, low enough to keep the ground under it.
+  static const double _maskOpacity = 0.85;
 
   final AnalysisService _service = AnalysisService();
   final MapController _mapController = MapController();
@@ -61,12 +67,20 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
   AnalysisResult? _result;
   _ResultView _view = _ResultView.compare;
 
-  /// True when a finished result should be shown as before/after scenes rather
-  /// than as points on the map.
-  bool get _showingCompare =>
+  /// The change mask, ready to draw: one raster per class, keyed by `mask`
+  /// value. Built once per run so panning and zooming never re-encode it.
+  Map<int, ImageProvider>? _masks;
+
+  /// Whether a finished result has enough imagery for the before/after page.
+  /// Either the raw scenes or the class maps is enough — the page can show
+  /// whichever came back, and the land-cover switch follows suit.
+  bool get _hasComparePage =>
       _result != null &&
-      _result!.hasComparisonImagery &&
-      _view == _ResultView.compare;
+      (_result!.hasComparisonImagery || _result!.hasClassMaps);
+
+  /// True when a finished result should be shown as before/after scenes rather
+  /// than as a mask on the map.
+  bool get _showingCompare => _hasComparePage && _view == _ResultView.compare;
 
   @override
   void initState() {
@@ -106,9 +120,11 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
               newYear: _newYear,
               newMonth: _newMonth,
             );
+      final masks = await _buildMasks(result);
       if (!mounted) return;
       setState(() {
         _result = result;
+        _masks = masks;
         _loading = false;
       });
     } on AnalysisException catch (e) {
@@ -126,8 +142,35 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
     }
   }
 
+  /// One raster per change class, spanning the analysed box.
+  ///
+  /// The backend renders both classes itself and those are used untouched; the
+  /// client-side painter only covers a response that carried none — an older
+  /// server, or the offline sample.
+  Future<Map<int, ImageProvider>> _buildMasks(AnalysisResult result) async {
+    final bounds = result.imageBounds ?? widget.bounds;
+    final sources = <int, ({Uint8List? png, Color color})>{
+      1: (png: result.deforestationPng, color: _deforestColor),
+      2: (png: result.waterLossPng, color: _waterColor),
+    };
+
+    final masks = <int, ImageProvider>{};
+    for (final entry in sources.entries) {
+      final bytes = entry.value.png ??
+          await rasterizeChanges(
+            changes: result.changes,
+            bounds: bounds,
+            mask: entry.key,
+            color: entry.value.color,
+          );
+      if (bytes != null) masks[entry.key] = MemoryImage(bytes);
+    }
+    return masks;
+  }
+
   void _reset() => setState(() {
         _result = null;
+        _masks = null;
         _error = null;
         _view = _ResultView.compare;
       });
@@ -274,13 +317,29 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
                     ),
                   ],
                 ),
-                if (_result != null && _result!.hasChanges)
-                  CircleLayer(circles: _changeMarkers(_result!.changes)),
+                // The mask spans the whole analysed box and is transparent where
+                // nothing changed, so one run paints the entire area at once —
+                // water loss first, so red wins where the two classes touch.
+                if (_masks != null && _masks!.isNotEmpty)
+                  ChangeMaskLayer(
+                    bounds: LatLngBounds(
+                      (_result?.imageBounds ?? b).sw,
+                      (_result?.imageBounds ?? b).ne,
+                    ),
+                    masks: [
+                      for (final mask in const [2, 1])
+                        if (_masks![mask] != null)
+                          ChangeMaskImage(
+                            image: _masks![mask]!,
+                            opacity: _maskOpacity,
+                          ),
+                    ],
+                  ),
               ],
             ),
           ),
         ),
-        if (_result != null && _result!.hasChanges) _buildLegend(),
+        if (_masks != null && _masks!.isNotEmpty) _buildLegend(),
         Positioned(
           right: 16,
           bottom: 16,
@@ -292,29 +351,6 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
         if (_loading) _buildLoadingOverlay(),
       ],
     );
-  }
-
-  List<CircleMarker> _changeMarkers(List<ChangePoint> pts) {
-    // Downsample for rendering if the backend returned a very large set; the
-    // headline counts still come from the full `stats`.
-    final step = pts.length > _maxRenderPoints
-        ? (pts.length / _maxRenderPoints).ceil()
-        : 1;
-    final markers = <CircleMarker>[];
-    for (var i = 0; i < pts.length; i += step) {
-      final p = pts[i];
-      final base = p.isDeforestation ? _deforestColor : _waterColor;
-      markers.add(
-        CircleMarker(
-          point: p.location,
-          radius: 3,
-          color: base.withValues(alpha: 0.75),
-          borderColor: base,
-          borderStrokeWidth: 0.5,
-        ),
-      );
-    }
-    return markers;
   }
 
   Widget _buildLegend() {
@@ -494,7 +530,7 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
           _SampleBanner(),
           const SizedBox(height: 12),
         ],
-        if (result.hasComparisonImagery) ...[
+        if (_hasComparePage) ...[
           _buildViewToggle(),
           const SizedBox(height: 14),
         ],
@@ -570,7 +606,7 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
         Text(
           result.hasChanges
               ? 'Detected ${_formatCount(result.changes.length)} changed pixels, '
-                  '${_showingCompare ? 'marked on both scenes above.' : 'shown on the map above.'}'
+                  '${_showingCompare ? 'drawn on the change picture above.' : 'shown on the map above.'}'
               : 'No change detected between the two dates.',
           style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
         ),

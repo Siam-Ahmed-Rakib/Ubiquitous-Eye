@@ -16,8 +16,10 @@
 .gitignore
 .claude/
 
-# The Flutter client is not part of either image.
-mobile/
+# The Flutter client's web build is baked into the `frontend` image by
+# mobile.Dockerfile; these are host-side build artefacts that stage recreates.
+mobile/build/
+mobile/.dart_tool/
 
 # Sentinel SCL scratch, 90 MB of which is one generated CSV. api_server.py
 # treats server/GRANULE as a write-only output directory and recreates it at

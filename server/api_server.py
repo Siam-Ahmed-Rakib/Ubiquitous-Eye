@@ -111,6 +111,56 @@ CHANGE_COLORS: dict[int, tuple[int, int, int]] = {
     2: (251, 140, 0),   # surface-water loss        #FB8C00
 }
 
+# ── Before/after land-cover class map ─────────────────────────────────────
+# Change detection classifies both dates in full (`classify_df`) and then keeps
+# only the pixels that differ. The class map returns that intermediate result as
+# a picture: every cell of each date painted by what it is, so the two dates can
+# be read as land cover rather than as raw reflectance.
+#
+# The five classifier labels fold into the three ground types the product
+# actually reasons about. `Crop` joins `Tree` (both vegetation) and `Building`
+# joins `Soil`, matching LAND_COVER_MERGE's precedent. Code 0 means the
+# composite had no cloud-free observation there.
+CLASS_MAP_CODES: dict[str, int] = {
+    "Tree": 1,
+    "Crop": 1,
+    "Water": 2,
+    "Soil": 3,
+    "Building": 3,
+}
+
+CLASS_MAP_NAMES: dict[int, str] = {1: "Tree", 2: "Water", 3: "Soil"}
+
+# Per-class dark -> mid -> light ramps. A flat fill per class throws away every
+# bit of texture the sensor recorded and reads as three paper cut-outs, so hue
+# carries the class while the scene's own brightness picks the point along the
+# ramp. Canopy structure, water depth and soil relief all survive that way.
+# The mid stop is the class's representative colour — it is what the legend
+# shows, and what a cell with no brightness signal falls back to.
+CLASS_MAP_RAMPS: dict[int, tuple[tuple[int, int, int], ...]] = {
+    1: ((10, 58, 32), (45, 125, 50), (156, 214, 160)),    # Tree  — deep canopy -> new leaf
+    2: ((7, 44, 80), (21, 101, 192), (147, 202, 249)),    # Water — deep -> shallow
+    3: ((92, 62, 43), (176, 137, 104), (233, 214, 186)),  # Soil  — wet earth -> dry sand
+}
+
+# Brightness is stretched per class before it indexes the ramp. Raw reflectance
+# occupies a narrow band within any one class, so without this every class comes
+# out near one end of its ramp and the gradient is wasted.
+CLASS_MAP_PERCENTILES = (4.0, 96.0)
+CLASS_MAP_GAMMA = 0.85  # < 1 lifts midtones, matching the true-colour render
+
+# ...but the stretched brightness is then held off the ends of the ramp. Letting
+# it run the full 0-1 makes one class span so much lightness that a bright patch
+# and a dark patch of the *same* class stop looking like the same thing — the
+# categorical reading, which is the whole job, loses to the shading. Keeping to
+# the middle of the ramp preserves the texture and keeps the hue in charge.
+CLASS_MAP_SHADE_RANGE = (0.16, 0.86)
+
+# Hairline drawn where two classes meet. Without it, adjacent patches of
+# similar lightness bleed into one another and the class boundary — the thing
+# the map exists to show — is the first thing lost.
+CLASS_MAP_EDGE_RGB = (9, 11, 13)
+
 # A changed pixel is one 10 m cell, which lands on ~1 px of a 1500 px-wide
 # render — effectively invisible. The overlay grows each hit by this many
 # pixels purely so it can be seen; the reported counts are never dilated.
@@ -126,8 +176,11 @@ CHANGE_RASTER_PX = 768
 # whole month while the analysis reads only days 1-15 — the picture showed a
 # different period than the numbers. v4 retires v3, whose two scenes were each
 # stretched independently, so the same ground took a different colour on each
-# side. Bump again whenever the response shape or the rendering changes.
-ANALYZE_CACHE_KIND = "analyze_v4"
+# side. v5 retires v4, which predates the per-date land-cover class maps — the
+# before/after view now offers them as a toggle, and an entry without them would
+# serve a view whose main control does nothing. Bump again whenever the response
+# shape or the rendering changes.
+ANALYZE_CACHE_KIND = "analyze_v5"
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -668,9 +721,12 @@ def analyze_change():
         # composites above read. Display-only: failure here must not lose an
         # otherwise-good analysis, so the client falls back to map points.
         old_image_b64 = new_image_b64 = None
+        old_scene = new_scene = None
         base_w = base_h = 0
         try:
-            old_image_b64, new_image_b64, base_w, base_h = _before_after_pngs(
+            (
+                old_image_b64, new_image_b64, base_w, base_h, old_scene, new_scene,
+            ) = _before_after_pngs(
                 polygon, old_year, old_month, new_year, new_month,
                 client_id, client_secret,
             )
@@ -681,9 +737,36 @@ def analyze_change():
                 request_id, exc,
             )
             old_image_b64 = new_image_b64 = None
+            old_scene = new_scene = None
 
         if base_w < 1 or base_h < 1:
             base_h, base_w = _change_raster_shape(west, south, east, north)
+
+        # ── Land-cover class maps ──
+        # `classify_df` already labelled every cell of both dates; only the cells
+        # that differ survive into `changes`. Rendering the full labelling gives
+        # the before/after view something to show besides raw reflectance — what
+        # each date *is*, not just where it changed. Display-only, like the
+        # imagery above, so a failure here must not lose the analysis.
+        old_class_b64 = new_class_b64 = None
+        old_classes: list[dict] = []
+        new_classes: list[dict] = []
+        try:
+            grid_shape = _grid_shape(old_df)
+            bbox = (west, south, east, north)
+            old_class_b64, old_classes = _class_map_png(
+                prev_df, grid_shape, bbox, old_scene, (base_h, base_w),
+            )
+            new_class_b64, new_classes = _class_map_png(
+                curr_df, grid_shape, bbox, new_scene, (base_h, base_w),
+            )
+            logger.info(
+                "[%s] class maps rendered from a %dx%d classifier grid",
+                request_id, grid_shape[1], grid_shape[0],
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[%s] class maps unavailable (%s)", request_id, exc)
+            old_class_b64 = new_class_b64 = None
 
         deforestation_png_b64 = _encode_png(
             _render_change_overlay(changed, 1, west, south, east, north, base_h, base_w), 1,
@@ -698,11 +781,17 @@ def analyze_change():
             "changes": changes,
             "oldImagePngBase64": old_image_b64,
             "newImagePngBase64": new_image_b64,
+            "oldClassPngBase64": old_class_b64,
+            "newClassPngBase64": new_class_b64,
             "deforestationPngBase64": deforestation_png_b64,
             "waterLossPngBase64": water_loss_png_b64,
             "imageWidth": base_w,
             "imageHeight": base_h,
             "bounds": {"north": north, "south": south, "east": east, "west": west},
+            # Deliberately not "classes": the cache's derived-table writer keys
+            # off a top-level `classes` *list* (see `_store_derived`), which is
+            # classify's shape, not this per-date pair.
+            "classBreakdown": {"old": old_classes, "new": new_classes},
             "stats": {
                 "totalPixels": len(merged),
                 "deforestation": int((changed["mask"] == 1).sum()),
@@ -936,6 +1025,186 @@ def _render_change_overlay(
     return Image.fromarray(rgba, mode="RGBA")
 
 
+def _class_code_grid(
+    df: pd.DataFrame,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Scatter a classified lon/lat/label table into a class-code raster.
+
+    `classify_df` concatenates two independently-classified subsets, so by the
+    time we see the table its row order no longer matches the grid
+    `build_dataframe` flattened — it cannot simply be reshaped. Placing every
+    row by its own coordinate instead, through the same linear bbox mapping the
+    change overlay uses, puts each cell back where it belongs whatever the order,
+    and keeps the class map registered with the change mask and the scenes.
+
+    Cells no row lands on stay 0 (no cloud-free observation).
+    """
+    codes = np.zeros((height, width), dtype=np.uint8)
+    if len(df) == 0 or height < 1 or width < 1:
+        return codes
+
+    lon_span = (east - west) or 1e-9
+    lat_span = (north - south) or 1e-9
+    lon = df["Longitude"].to_numpy(dtype=np.float64)
+    lat = df["Latitude"].to_numpy(dtype=np.float64)
+    cols = np.clip(((lon - west) / lon_span * width).astype(int), 0, width - 1)
+    rows = np.clip(((north - lat) / lat_span * height).astype(int), 0, height - 1)
+
+    labels = df["classifier"].to_numpy()
+    for name, code in CLASS_MAP_CODES.items():
+        hit = labels == name
+        if hit.any():
+            codes[rows[hit], cols[hit]] = code
+    return codes
+
+
+def _class_edges(codes: np.ndarray) -> np.ndarray:
+    """Hairline mask along the seams between differing classes.
+
+    Only the cell on one side of each seam is marked — each axis is compared
+    against the neighbour ahead of it — so a shared boundary comes out one pixel
+    wide rather than two. Unclassified cells are excluded on both sides, so the
+    outer edge of coverage is not outlined; that is a data limit, not a boundary
+    between two things on the ground.
+    """
+    edge = np.zeros(codes.shape, dtype=bool)
+    labelled = codes > 0
+    edge[:-1, :] |= labelled[:-1, :] & labelled[1:, :] & (codes[:-1, :] != codes[1:, :])
+    edge[:, :-1] |= labelled[:, :-1] & labelled[:, 1:] & (codes[:, :-1] != codes[:, 1:])
+    return edge
+
+
+def _shade_along_ramp(ramp: tuple[tuple[int, int, int], ...], t: np.ndarray) -> np.ndarray:
+    """Evaluate a three-stop colour ramp at positions `t` in [0, 1].
+
+    Returns an (N, 3) float array. Two linear segments (dark->mid, mid->light)
+    give the curve a defined middle, which a straight dark->light interpolation
+    does not: the mid stop is the class's recognisable colour, and it should land
+    at mid brightness rather than wherever a two-point blend happens to put it.
+    """
+    stops = np.asarray(ramp, dtype=np.float64)
+    lower = np.where(t < 0.5, 0, 1)
+    frac = np.where(t < 0.5, t * 2.0, (t - 0.5) * 2.0)
+    start = stops[lower]
+    end = stops[lower + 1]
+    return start + (end - start) * frac[:, None]
+
+
+def _render_class_map(codes: np.ndarray, luma: np.ndarray | None) -> Image.Image:
+    """Paint a class-code raster as a shaded, outlined land-cover map.
+
+    `luma` is the scene's own brightness in [0, 1] on the same grid, and is what
+    keeps this from looking like a paint-by-numbers: it picks each cell's point
+    along its class ramp. It is stretched *within* each class, because a class
+    occupies only a narrow slice of the scene's overall range — stretching
+    globally would leave water permanently at the dark end of its ramp and soil
+    permanently at the light end, wasting both.
+
+    Pass `luma=None` (no imagery came back) and every cell takes its class's mid
+    stop, i.e. the flat single-colour rendering.
+    """
+    height, width = codes.shape
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    if height < 1 or width < 1:
+        return Image.fromarray(rgba, mode="RGBA")
+
+    shade = (
+        np.full(codes.shape, 0.5, dtype=np.float64)
+        if luma is None
+        else np.clip(np.asarray(luma, dtype=np.float64), 0.0, 1.0)
+    )
+
+    for code, ramp in CLASS_MAP_RAMPS.items():
+        hit = codes == code
+        if not hit.any():
+            continue
+        values = shade[hit]
+        low, high = np.percentile(values, CLASS_MAP_PERCENTILES)
+        if high <= low:  # a class of uniform brightness — sit it at the mid stop
+            position = np.full(values.shape, 0.5)
+        else:
+            position = np.clip((values - low) / (high - low), 0.0, 1.0) ** CLASS_MAP_GAMMA
+            floor, ceiling = CLASS_MAP_SHADE_RANGE
+            position = floor + position * (ceiling - floor)
+        rgba[hit, :3] = _shade_along_ramp(ramp, position).round().astype(np.uint8)
+        rgba[hit, 3] = 255
+
+    edges = _class_edges(codes)
+    rgba[edges, :3] = CLASS_MAP_EDGE_RGB
+    rgba[edges, 3] = 255
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _luma_from_rgba(img: Image.Image) -> np.ndarray:
+    """Perceived brightness in [0, 1] of a rendered RGBA scene.
+
+    Taken from the *rendered* image rather than raw reflectance so both dates'
+    class maps are shaded on the shared before/after stretch — the same ground
+    then shades the same way on both sides, which is the whole point of that
+    stretch existing.
+    """
+    arr = np.asarray(img.convert("RGBA"), dtype=np.float64)
+    luma = (
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    ) / 255.0
+    # Transparent cells carry no signal; mid keeps them off both ramp extremes.
+    return np.where(arr[..., 3] > 0, luma, 0.5)
+
+
+def _class_map_png(
+    df: pd.DataFrame,
+    grid_shape: tuple[int, int],
+    bbox: tuple[float, float, float, float],
+    scene: Image.Image | None,
+    target: tuple[int, int],
+) -> tuple[str, list[dict]]:
+    """Render one date's classification as a PNG, plus its class breakdown.
+
+    `grid_shape` is the classifier's own (rows, cols); `target` is the (height,
+    width) of the scene imagery. The codes are built at the classifier's
+    resolution — one cell per actual prediction, so the counts are exact — then
+    nearest-neighbour resized to the scene's shape. Resizing the *codes* rather
+    than the finished picture is what keeps the outlines a crisp single pixel at
+    full size instead of a staircase scaled up with everything else.
+    """
+    west, south, east, north = bbox
+    grid_h, grid_w = grid_shape
+    codes = _class_code_grid(df, west, south, east, north, grid_h, grid_w)
+
+    total = int((codes > 0).sum())
+    classes = []
+    for code, name in CLASS_MAP_NAMES.items():
+        count = int((codes == code).sum())
+        red, green, blue = CLASS_MAP_RAMPS[code][1]
+        classes.append({
+            "name": name,
+            "color": f"#{red:02X}{green:02X}{blue:02X}",
+            "pixels": count,
+            "percent": round(100.0 * count / total, 2) if total else 0.0,
+        })
+    classes.sort(key=lambda c: c["pixels"], reverse=True)
+
+    target_h, target_w = target
+    if (target_h, target_w) != (grid_h, grid_w) and target_h > 0 and target_w > 0:
+        codes = np.asarray(
+            Image.fromarray(codes, mode="L").resize((target_w, target_h), Image.NEAREST)
+        )
+
+    luma = _luma_from_rgba(scene) if scene is not None else None
+    if luma is not None and luma.shape != codes.shape:
+        # Defensive: a scene of a different shape cannot shade this grid, and
+        # guessing an alignment would put texture on the wrong ground.
+        luma = None
+
+    return _encode_png(_render_class_map(codes, luma), 1), classes
+
+
 def _joint_stretch_bounds(scenes: list[tuple[np.ndarray, np.ndarray]]) -> tuple[float, float]:
     """One (low, high) reflectance range shared by every band of every scene."""
     pool = []
@@ -1007,14 +1276,17 @@ def _before_after_pngs(
     new_month: int,
     client_id: str,
     client_secret: str,
-) -> tuple[str, str, int, int]:
+) -> tuple[str, str, int, int, Image.Image, Image.Image]:
     """Fetch both dates' scenes and render them through one shared stretch.
 
     ``whole_month=False`` matches the composites change detection reads (days
     1-15), so the picture covers the period the numbers came from.
 
-    Returns ``(old_b64, new_b64, width, height)``. Raises if either fetch fails —
-    the caller decides whether comparison imagery is optional.
+    Returns ``(old_b64, new_b64, width, height, old_img, new_img)``. The rendered
+    images come back alongside the encoded ones so the class maps can be shaded
+    from the same stretch rather than re-deriving a second, inconsistent one.
+    Raises if either fetch fails — the caller decides whether comparison imagery
+    is optional.
     """
     old_rgb, old_valid = fetch_true_color_base(
         polygon, old_year, old_month, client_id, client_secret, whole_month=False,
@@ -1033,6 +1305,8 @@ def _before_after_pngs(
         _encode_png(new_img, 1),
         min(old_img.width, new_img.width),
         min(old_img.height, new_img.height),
+        old_img,
+        new_img,
     )
 
 
@@ -1230,6 +1504,14 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
     water_loss_png, _, _ = _crop_png_b64(
         payload.get("waterLossPngBase64"), cached_bounds, req_bbox,
     )
+    # The class maps span the same bounds and shape as the scenes, so the same
+    # crop lands on the same ground.
+    old_class_png, _, _ = _crop_png_b64(
+        payload.get("oldClassPngBase64"), cached_bounds, req_bbox,
+    )
+    new_class_png, _, _ = _crop_png_b64(
+        payload.get("newClassPngBase64"), cached_bounds, req_bbox,
+    )
     if sub_w < 1 or sub_h < 1:
         sub_w, sub_h = mask_w, mask_h
 
@@ -1239,11 +1521,17 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
         "changes": changes,
         "oldImagePngBase64": old_png,
         "newImagePngBase64": new_png,
+        "oldClassPngBase64": old_class_png,
+        "newClassPngBase64": new_class_png,
         "deforestationPngBase64": deforestation_png,
         "waterLossPngBase64": water_loss_png,
         "imageWidth": sub_w,
         "imageHeight": sub_h,
         "bounds": {"north": rn, "south": rs, "east": re_, "west": rw},
+        # No `classBreakdown`: the shares are counted from the classifier's code
+        # grid, which is not stored, and the gradient-shaded PNG cannot be
+        # counted back. The map itself crops exactly; only the percentages are
+        # unavailable for a subset, and the UI simply omits them.
         "stats": stats,
         "requestId": payload.get("requestId"),
         "cached": True,
