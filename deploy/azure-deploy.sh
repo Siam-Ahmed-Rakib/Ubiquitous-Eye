@@ -12,7 +12,8 @@
 set -euo pipefail
 
 RG=ubiquitous-eye-rg
-LOC=southeastasia
+RG_LOC=southeastasia
+LOC=malaysiawest
 ENVN=ubiquitous-eye-env
 APP=ubiquitous-eye
 IMG=ubiquitous-eye:latest
@@ -40,14 +41,17 @@ for ns in Microsoft.App Microsoft.ContainerRegistry Microsoft.OperationalInsight
 done
 
 say "resource group $RG ($LOC)"
-az group create -n "$RG" -l "$LOC" --only-show-errors -o none
+az group create -n "$RG" -l "$RG_LOC" --only-show-errors -o none
 
 say "container registry $ACR"
-az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -l "$LOC" --only-show-errors -o none
+if ! az acr show -n "$ACR" -g "$RG" --only-show-errors >/dev/null 2>&1; then
+  az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -l "$LOC" --only-show-errors -o none
+fi
 echo "  -> $ACR.azurecr.io"
 
-say "building image IN Azure (this is the slow step, ~10-15 min)"
-az acr build --registry "$ACR" -g "$RG" -f server/Dockerfile -t "$IMG" .
+say "using locally built image already pushed to ACR"
+
+echo "  -> $ACR.azurecr.io/$IMG"
 
 say "container apps environment"
 az containerapp env create -n "$ENVN" -g "$RG" -l "$LOC" --logs-destination none --only-show-errors -o none

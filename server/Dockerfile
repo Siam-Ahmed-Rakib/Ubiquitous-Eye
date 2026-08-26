@@ -6,7 +6,7 @@ FROM ghcr.io/cirruslabs/flutter:stable AS frontend-builder
 WORKDIR /app
 
 # Resolve dependencies first so a source-only change reuses this layer.
-COPY mobile/pubspec.yaml mobile/pubspec.lock ./
+COPY mobile/pubspec.yaml ./
 RUN flutter pub get
 
 COPY mobile/ ./
@@ -16,6 +16,7 @@ COPY mobile/ ./
 # hostname here would pin the image to one deployment URL. Set it only to point
 # the UI at a backend somewhere other than the one serving it.
 ARG BACKEND_URL=
+RUN flutter create . --platforms web
 RUN flutter build web --release --dart-define=BACKEND_URL=${BACKEND_URL}
 
 FROM python:3.12-slim AS runtime
