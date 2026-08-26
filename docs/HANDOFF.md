@@ -1,145 +1,279 @@
-# Handoff — 2026-08-26, ~18:15 (+06)
+# HANDOFF - read this first
 
-Written mid-session on a Windows machine, to be resumed on an Ubuntu machine.
-Everything below is verified unless marked otherwise.
+Written 2026-08-26 evening on the user's **Windows** machine, for a fresh Claude
+session on the user's **Ubuntu** machine.
 
-## The one thing to do first
+---
 
-The user has a **presentation at 19:30 on 2026-08-26** and needs a working public
-link. Azure is the goal; a tunnel is the fallback.
+## TL;DR - what to do
+
+Deploy the backend to Azure Container Apps. Everything is prepared; it is one command.
 
 ```bash
-# On the Ubuntu machine, where `az account show` already works:
-git clone https://github.com/Siam-Ahmed-Rakib/Ubiquitous-Eye.git
-cd Ubiquitous-Eye
-cat > .env <<'EOF'
-SH_CLIENT_ID=<from the Windows box: E:\Ubiquitous-Eye\.env>
-SH_CLIENT_SECRET=<same>
-DATABASE_URL=<same>
-EOF
+cd ~/Ubiquitous-Eye          # or wherever you cloned it
+az account show              # must succeed; if not see "Azure login" below
+cat .env                     # must have 3 lines; see "Secrets" below
 bash deploy/azure-deploy.sh
 ```
 
-That script needs **no Docker** — `az acr build` uploads only the build context
-(~30 MB after `.dockerignore`) and builds the image inside Azure. It provisions a
-resource group, an ACR (Basic), a Container Apps environment, and the app at
-0.5 vCPU / 1 GiB, min-replicas 1, in **southeastasia**. It prints the live URL and
-the exact `flutter build apk` command with that URL substituted.
+Takes ~15-20 minutes, mostly the image build. It prints the live URL at the end, plus
+the exact `flutter build apk` command with that URL already substituted.
 
-Expect ~15-20 minutes, most of it the image build.
+Then work through **Testing after deploy** near the bottom.
 
-## Why Azure could not be done from Windows
+---
 
-`az login` fails with **`AADSTS530035`, `Device state: Unregistered`**, for
-`2105158@ugrad.cse.buet.ac.bd` on tenant `10d93f4f-3089-4c95-8cea-c56f9dea2aa7`
-("Default Directory"). That is a Conditional Access policy requiring a
-registered/compliant device, and it blocks the **Azure Portal** too — so it is a
-tenant policy, not a CLI or auth-method problem. Device-code flow is *also* blocked
-by security defaults. Only a BUET tenant admin can change this. The user's Ubuntu
-machine has a working Azure session, which is why the deploy moved there.
+## What this project is
 
-Do not spend time retrying `az login` on Windows.
+Satellite land-cover classification and change detection over Bangladesh.
 
-## Fallback if Azure fails: temporary public link
+- `server/` - Flask + gunicorn API. Pulls Sentinel-2 and Landsat scenes from Sentinel
+  Hub, builds a cloud-masked monthly median composite, runs a 4-model ensemble
+  (XGBoost / CatBoost / LightGBM / CART) per pixel, returns labelled cells plus PNG
+  overlays.
+- `mobile/` - Flutter client, web and Android. **This is the product.**
+- `Frontend/` - older React client. Still in the repo, **not deployed**, ignore it.
+- Supabase Postgres - caches whole API responses, so a repeated area is instant.
 
-Local stack is verified working. `cloudflared` is already downloaded to
-`C:\Users\USER\cloudflared.exe` on the Windows box.
+**One container serves everything.** `server/Dockerfile` has two stages: stage one runs
+`flutter build web` over `mobile/`, stage two is the Python runtime and copies that
+bundle to `/app/frontend_dist`. `api_server.py` serves the UI from `/` and the API from
+`/api/*`. Same origin means no CORS, one URL, one thing to deploy.
+
+---
+
+## Where we stand
+
+### Done and verified
+
+| item | state |
+|---|---|
+| Image rebuilt from current source | done - it had been running 4-week-old code (`analyze_v4`, no class maps) |
+| Flutter client baked into the backend image, React dropped | done - verified serving `/`, `main.dart.js`, `canvaskit.wasm` as `application/wasm`, `manifest.json`, SPA fallback, `/api/*` 404 guard |
+| Web client is origin-relative | done - `mobile/lib/config.dart` reads `Uri.base.origin` on web, so one image works at any URL with no rebuild and no CORS |
+| Class-map PNG latency fix | done - 12x faster, 14% smaller, byte-identical pixels |
+| Renamed terrascope to Ubiquitous Eye | done - 15 files plus regenerated `android/`; `flutter analyze` clean |
+| Release-APK INTERNET permission | done - Flutter grants it only to debug/profile builds |
+| sklearn 1.6.1 vs 1.9.0 pickle warning | investigated, benign, do not change the pin |
+| Database | live - 47 cache rows, 168,777 classification points, on the rotated password |
+| Sentinel Hub credentials | renewed 2026-08-26, live fetches work |
+
+### Not done
+
+- **Azure deploy** - this is your job. The script is written and committed.
+- **APK build** - Gradle crashed on Windows with `Gradle build daemon disappeared
+  unexpectedly`, almost certainly memory contention with Docker running. Untested on
+  Ubuntu. Do it after the deploy, against the live URL.
+
+---
+
+## Azure login
+
+Azure works on **Ubuntu** but not on **Windows**. On Windows `az login` fails with:
 
 ```
-docker compose --project-directory . up -d          # if not already running
-& "C:\Users\USER\cloudflared.exe" tunnel --url http://localhost:5001
+AADSTS530035 - Access has been blocked by security defaults
+Device state: Unregistered
 ```
 
-It prints `https://<random>.trycloudflare.com`. Leave that terminal open.
+That is a BUET tenant Conditional Access policy requiring a registered device. It
+blocks the Azure **Portal** as well, so it is not a CLI problem and not fixable without
+a tenant admin. That is the whole reason this work moved to Ubuntu.
 
-Caveats the user has been told: the link dies with the laptop/terminal, the URL
-changes on every restart, and all traffic crosses their home upload. Fine for a
-live demo, **not** something to hand a supervisor for later use.
+- Account: `2105158@ugrad.cse.buet.ac.bd`
+- Tenant: `10d93f4f-3089-4c95-8cea-c56f9dea2aa7` ("Default Directory")
+- Subscription: Azure for Students, $100/yr, no card attached - so it cannot overspend;
+  Azure suspends the subscription when the credit runs out.
 
-An earlier `ssh -R 80:localhost:5001 nokey@localhost.run` tunnel worked but
-**collapsed under load** — a ~890 KB classify response took 65 s and then the
-tunnel started returning 503. Do not use localhost.run for this payload size.
+If `az account show` fails on Ubuntu, try plain `az login` first. If it lands in a
+tenant with no subscriptions, retry with
+`az login --tenant 10d93f4f-3089-4c95-8cea-c56f9dea2aa7`.
 
-## What was completed today
+---
 
-**Rebuilt the image from HEAD.** It had been running 2026-07-29 code — `analyze_v4`,
-1425 lines, no `_class_map_png` at all — because `docker compose build` had been
-failing. Cause was pip dying mid-download after several large wheels (a resolver
-giving out under load, not absent DNS); fixed with `--retries 10 --timeout 120`.
+## Secrets
 
-**Swapped the served UI from React to Flutter.** `server/Dockerfile` stage one is now
-`ghcr.io/cirruslabs/flutter:stable` building `mobile/`. Verified serving through the
-container: `/` (title "Ubiquitous Eye"), `main.dart.js` 2.87 MB, `canvaskit.wasm`
-7.23 MB as `application/wasm`, `manifest.json`, SPA fallback, and the `/api/*` 404
-guard all correct.
+`.env` at the repo root is gitignored and does **not** come with a clone. It needs
+exactly three lines:
 
-**Made the web client origin-relative.** `mobile/lib/config.dart` now resolves
-`BACKEND_URL` → `Uri.base.origin` on web → localhost off web. One image works at any
-URL with no rebuild and no CORS. `kBackendBaseUrl` changed `const` → `final`; both
-call sites use it as a runtime expression so this is a drop-in.
+```
+SH_CLIENT_ID=...
+SH_CLIENT_SECRET=...
+DATABASE_URL=postgresql://postgres.<ref>:<password>@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres
+```
 
-**Fixed the class-map latency regression** (commit 2583694, "coloring map converted
-but latency increased"). `_encode_png` used Pillow `optimize=True` everywhere. On
-flat banded class-map content that is pathological. Measured at 1500x1500:
+The user has these on the Windows machine at `E:\Ubiquitous-Eye\.env`.
+
+**Heredoc gotcha that already bit once:** the closing `EOF` must be alone on its own
+line at column zero. Glued to the end of the `DATABASE_URL` line, the value silently
+gets `EOF` appended and the shell hangs. Verify with `wc -l .env` (expect 3) and check
+that `DATABASE_URL` ends in `/postgres`.
+
+**Never print these values.** Confirm presence by length or hash only.
+
+---
+
+## What the deploy script does
+
+`deploy/azure-deploy.sh`:
+
+1. Registers `Microsoft.App`, `Microsoft.ContainerRegistry`, `Microsoft.OperationalInsights`.
+2. Creates resource group `ubiquitous-eye-rg` in **southeastasia**.
+3. Creates an Azure Container Registry, Basic SKU, admin enabled.
+4. Runs **`az acr build`** - uploads only the build context (~30 MB after
+   `.dockerignore`) and builds the image **inside Azure**. This is why Ubuntu needs no
+   Docker at all.
+5. Creates a Container Apps environment with `--logs-destination none`, to avoid a
+   Log Analytics bill.
+6. Creates the Container App: **0.5 vCPU / 1 GiB, min-replicas 1, max 3**, external
+   ingress, target port 5000. Secrets are injected as Container Apps secrets, never
+   baked into the image.
+7. Prints the FQDN.
+
+**Why 0.5 vCPU and not more** - measured, please do not re-litigate: a cold classify is
+98% serial Sentinel Hub round-trips. The 4-model ensemble over 31,659 cells takes
+**0.30 s**. Container CPU peaked at 51% (never saturated a single core) and RAM at
+266 MB. Nothing in the pipeline is parallel, so core count buys nothing. The 1 GiB is
+headroom for large areas, not throughput.
+
+**Cost:** roughly $15.55/mo for the app plus $5.07/mo for ACR in Southeast Asia, so
+about 5 months of the $100 grant. ghcr.io plus GitHub Actions would be free and buy
+back the ACR cost, but needs a workflow file - and the user pushes, not Claude.
+
+---
+
+## Testing after deploy
+
+Substitute the URL the script printed.
+
+```bash
+U=https://<fqdn>
+
+# 1. service up
+curl -s $U/api/health
+
+# 2. Flutter UI served from the same origin
+curl -s $U/ | grep -o "<title>.*</title>"
+curl -sI $U/canvaskit/canvaskit.wasm | grep -i content-type    # expect application/wasm
+
+# 3. a real classification - this area IS cached, expect ~2 s
+curl -s -X POST $U/api/sentinel/classify \
+  -H "Content-Type: application/json" \
+  -d @- <<'JSON' -o /tmp/c.json -w "%{http_code} %{size_download}B %{time_total}s\n"
+{"polygon":[[90.5805528458285,23.8364742130499],[90.6298069680125,23.8364742130499],[90.6298069680125,23.881519258095],[90.5805528458285,23.881519258095]],"year":2026,"month":2}
+JSON
+
+python3 -c "import json;d=json.load(open('/tmp/c.json'));print(d['status'],d['cached'],d['message'])"
+```
+
+Expect `success True Classified 27880 of 27880 cells`.
+
+**Then open the URL in a browser and actually use the app** - draw a box, run a
+classification, watch the console. curl passing is not the same as the UI working.
+
+### Areas already cached (respond in ~2 s)
+
+Anything else runs the live pipeline: **~160 s for classify, ~170 s for analyze**. That
+is not a bug - it is a month of satellite scenes being fetched one at a time.
+
+Classify:
+
+- `2026-02` lon 90.5806-90.6298, lat 23.8365-23.8815
+- `2026-01` lon 90.3158-90.3651, lat 23.7510-23.7960
+- `2026-01` lon 90.3562-90.4054, lat 23.8139-23.8589
+
+Analyze (`analyze_v5`):
+
+- `2020-10 -> 2025-10` lon 90.4652-90.5434, lat 23.9017-23.9822  (8 x 9 km, best demo)
+- `2024-06 -> 2026-08` lon 90.4063-90.4244, lat 23.7581-23.7786
+
+Full list in `DEMO.md` at the repo root.
+
+---
+
+## Then: the APK
+
+Only after the URL exists.
+
+```bash
+cd mobile
+flutter pub get
+flutter build apk --release --dart-define=BACKEND_URL=https://<fqdn>
+# -> build/app/outputs/flutter-apk/app-release.apk
+```
+
+**`--dart-define` is mandatory.** The origin fallback in `config.dart` is web-only; a
+phone app has no serving origin and falls back to `http://localhost:5000`, which on a
+phone means the phone itself. Without it the APK installs, launches, draws the map
+shell, and then fails every request with no obvious cause.
+
+If Gradle dies with "daemon disappeared unexpectedly", it is memory. Stop Docker first,
+or add to `mobile/android/gradle.properties`:
+
+```
+org.gradle.jvmargs=-Xmx2048m
+```
+
+---
+
+## Standing instructions from the user
+
+- **Do not `git push`** unless told to in that specific message. The user pushes.
+- **Ask before implementing anything ambiguous.** Do not settle a design question with
+  your own choice.
+- **Do not delete rows from `analysis_cache`.** Offered three times, declined each
+  time. 32 rows in superseded formats hold ~64 MB. Leave them.
+- **Never print secret values.**
+- The user has explicitly declined parallelising the Sentinel Hub fetch loops - "that
+  fetching wait is acceptable". Do not re-propose it unprompted.
+
+---
+
+## Traps that have already cost hours
+
+- **Sentinel Hub `403 Invalid or expired account`** is an account problem, not a
+  credential one. `sentinelhub` acquires its OAuth token *before* the catalog call, so
+  a 403 at `catalog.search` with no token error means the subscription lapsed. Do not
+  read a 500 from classify/analyze as a code regression before checking the log.
+- **Supabase pauses free projects after 7 idle days**, and a paused project stops
+  resolving in DNS entirely - which looks exactly like deletion. It is not. Restore it
+  from the dashboard, then wait a few minutes for the connection pooler to re-register
+  the tenant; until it does you get `tenant/user ... not found`.
+- **Flutter grants `INTERNET` only in the `debug/` and `profile/` manifests.** Release
+  builds use `main/`. Already fixed - do not let a regenerated `android/` drop it.
+- **`docker-compose.yml` must not mount `./Frontend/dist` over `/app/frontend_dist`.**
+  It shadowed the UI the image builds with an empty host directory, so the backend
+  served a blank page locally while the image itself was fine. Already fixed.
+- **Cloudflare quick tunnels enforce a ~100 s origin timeout (error 524).** An uncached
+  analyze takes ~170 s and therefore always failed through the tunnel that was used as
+  a stopgap. That is a tunnel limit, not an app bug, and hosting removes it.
+- **On Windows, run `docker exec -w /app ...` through PowerShell, not Bash** - the Bash
+  tool mangles `/app` into a Windows path. Irrelevant on Ubuntu.
+
+---
+
+## The PNG fix, in case it comes up
+
+Commit 2583694 ("coloring map converted but latency increased") added per-date
+land-cover class maps and slowed `/analyze` down. Cause: `_encode_png` used Pillow's
+`optimize=True` everywhere, which forces maximum zlib effort and trials every row
+filter. On flat banded class-map content that is pathological. Measured at 1500x1500:
 
 | setting | time | b64 size |
 |---|---|---|
 | `optimize=True` | 5.72 s | 5748 KB |
 | default (level 6) | 0.89 s | 5847 KB |
-| **`compress_level=3`** | **0.47 s** | **4956 KB** |
+| `compress_level=3` | **0.47 s** | **4956 KB** |
 
-12x faster *and* smaller, byte-identical pixels. `_class_map_png` runs twice per
-analyze → **~10.5 s off every change-detection request**. Photographic true-colour
-scenes keep `optimize=True`, where level 3 would be 2x faster but 15% *larger*.
+12x faster **and** smaller, decoding to byte-identical pixels. `_class_map_png` runs
+twice per analyze, so this is ~10.5 s off every change-detection request. Photographic
+true-colour scenes deliberately keep `optimize=True`, where level 3 would be 2x faster
+but 15% **larger**.
 
-**Renamed the project** terrascope → Ubiquitous Eye across 15 files, regenerated
-`android/` as `com.ubiquitouseye.ubiquitous_eye`. `flutter analyze` clean.
+---
 
-**Fixed a release-APK blocker.** Flutter's template grants `INTERNET` only in
-`debug/` and `profile/` manifests; release builds use `main/`. Without the fix the
-APK installs, launches, and then fails every backend call and every map tile.
+## More background
 
-**Cleared a false alarm.** sklearn warns the pickles were written by 1.6.1 while the
-image ships 1.9.0. Ran both versions against the same models: `scaler.mean_`,
-`scaler.scale_`, the full scaled matrix, the decision-tree predictions and the label
-encoder classes all hash **identically**. The warning is benign; do not change the pin.
-
-**Database.** Supabase had paused; the user restored it and rotated the password.
-Verified live on the new credentials: 47 rows in `analysis_cache`, 44 in
-`classification_result`, **168,777** in `classification_point`, 4 in
-`land_cover_class`. 133 MB of a 500 MB free tier.
-
-## Not finished
-
-**APK build.** Gradle died with `Gradle build daemon disappeared unexpectedly` and
-JVM crash dumps, almost certainly memory contention — Docker Desktop, a Flutter web
-build and a Gradle daemon at once. Not yet retried in isolation. The Android
-toolchain itself is fine: Flutter 3.35.2, Android SDK 36.1.0-rc1, Android Studio
-2025.1.3 all report `[√]`. Once a URL exists:
-
-```sh
-cd mobile
-flutter build apk --release --dart-define=BACKEND_URL=https://<live-url>
-# -> build/app/outputs/flutter-apk/app-release.apk
-```
-
-The `--dart-define` is **mandatory** for the APK. `config.dart`'s origin fallback is
-web-only; a phone app has no serving origin and falls back to `http://localhost:5000`,
-which on a phone means the phone itself.
-
-**Registry choice.** `deploy/azure-deploy.sh` uses ACR Basic (~$5.07/mo). The user
-leaned toward ghcr.io + GitHub Actions (free) but that needs a workflow file only
-they can push. On a $100 student grant this is roughly the difference between 6 and
-8.5 months of runway. Worth revisiting after the deadline.
-
-**Sizing rationale, so it is not re-litigated.** Measured, not guessed: a cold
-classify is 98% serial Sentinel Hub round-trips; the 4-model ensemble over 31,659
-cells takes **0.30 s**; container CPU peaked at 51% (never saturated one core) and
-RAM at 266 MB. Core count buys nothing — nothing in the pipeline is parallel. The
-user has explicitly declined parallelising the fetch loops ("that fetching wait is
-acceptable"). Do not re-propose it unprompted.
-
-## Repository state
-
-Last commit `c8fa60d`. **The user pushes, never Claude.** If `git log
-origin/master..master` is non-empty, ask them to push rather than doing it.
+`docs/project-memory/` holds the accumulated findings - cache architecture and its
+schema traps, where backend latency actually lives, the Sentinel Hub diagnosis, and the
+hosting-options survey. Worth skimming if something surprises you.
