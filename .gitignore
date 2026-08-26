@@ -19,3 +19,7 @@ server/GRANULE/**/*.csv
 
 # Flutter tool crash reports
 mobile/flutter_*.log
+
+# JVM crash dumps (Gradle daemon crashes)
+hs_err_pid*.log
+**/hs_err_pid*.log

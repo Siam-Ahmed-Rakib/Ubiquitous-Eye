@@ -1,4 +1,4 @@
-# TerraScope — Mobile App (Flutter)
+# Ubiquitous Eye — Mobile App (Flutter)
 
 The mobile client for **Ubiquitous Eyes** — a SkyFi-style satellite-imagery
 tasking and analytics app. It lives alongside the React web `Frontend/` and the
@@ -319,7 +319,7 @@ git-ignored, so only the Dart source ships here. To run:
    `NavigationRail`), so use a current stable channel (Flutter 3.27+).
 2. Generate the platform folders **without touching `lib/` or `pubspec.yaml`**:
    ```sh
-   flutter create --platforms=android,ios,web --org com.terrascope .
+   flutter create --platforms=android,ios,web --org com.ubiquitouseye .
    ```
 3. Fetch packages and run:
    ```sh

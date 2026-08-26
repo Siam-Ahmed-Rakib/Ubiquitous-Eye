@@ -5,11 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:terrascope/models/analysis_result.dart';
-import 'package:terrascope/models/area_bounds.dart';
-import 'package:terrascope/services/analysis_service.dart';
-import 'package:terrascope/util/change_raster.dart';
-import 'package:terrascope/widgets/change_mask_layer.dart';
+import 'package:ubiquitous_eye/models/analysis_result.dart';
+import 'package:ubiquitous_eye/models/area_bounds.dart';
+import 'package:ubiquitous_eye/services/analysis_service.dart';
+import 'package:ubiquitous_eye/util/change_raster.dart';
+import 'package:ubiquitous_eye/widgets/change_mask_layer.dart';
 
 /// A unit box sampled every 0.1° — 11 cells on each side.
 const _bounds = AreaBounds(north: 1, south: 0, east: 1, west: 0);

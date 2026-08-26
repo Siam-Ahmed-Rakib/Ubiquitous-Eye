@@ -2,18 +2,18 @@ import 'package:flutter/material.dart';
 
 import 'screens/main_scaffold.dart';
 
-void main() => runApp(const TerraScopeApp());
+void main() => runApp(const UbiquitousEyeApp());
 
 /// App accent — the orange used across the SkyFi-style UI (nav bar, badges).
 const Color kAccent = Color(0xFFEF9A3D);
 
-class TerraScopeApp extends StatelessWidget {
-  const TerraScopeApp({super.key});
+class UbiquitousEyeApp extends StatelessWidget {
+  const UbiquitousEyeApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'TerraScope',
+      title: 'Ubiquitous Eye',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,

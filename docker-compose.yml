@@ -12,7 +12,12 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
     volumes:
       - ./server/GRANULE:/app/GRANULE
-      - ./Frontend/dist:/app/frontend_dist
+      # NOT ./Frontend/dist:/app/frontend_dist -- server/Dockerfile builds the
+      # React app in its own stage and copies the result to /app/frontend_dist.
+      # Mounting the host path over it shadowed the built copy with an empty
+      # directory (.dockerignore excludes Frontend/dist precisely because the
+      # host copy is meant to be discarded), so the backend served no UI at all
+      # and local behaviour silently diverged from the deployed image.
     ports:
       - "5000:5000"
     restart: unless-stopped

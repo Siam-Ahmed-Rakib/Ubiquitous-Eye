@@ -4,10 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
-import 'package:terrascope/models/area_bounds.dart';
-import 'package:terrascope/models/land_use_result.dart';
-import 'package:terrascope/screens/analysis/land_use_screen.dart';
-import 'package:terrascope/services/land_use_service.dart';
+import 'package:ubiquitous_eye/models/area_bounds.dart';
+import 'package:ubiquitous_eye/models/land_use_result.dart';
+import 'package:ubiquitous_eye/screens/analysis/land_use_screen.dart';
+import 'package:ubiquitous_eye/services/land_use_service.dart';
 
 /// A 1×1 transparent PNG — enough to prove the base64 round-trip.
 const _pngBase64 =

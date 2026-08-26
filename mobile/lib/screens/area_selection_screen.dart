@@ -143,13 +143,13 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
         children: [
           TileLayer(
             urlTemplate: _satellite ? _imageryUrl : _streetUrl,
-            userAgentPackageName: 'com.terrascope.app',
+            userAgentPackageName: 'com.ubiquitouseye.app',
             maxNativeZoom: 18,
           ),
           if (_satellite)
             TileLayer(
               urlTemplate: _labelsUrl,
-              userAgentPackageName: 'com.terrascope.app',
+              userAgentPackageName: 'com.ubiquitouseye.app',
               maxNativeZoom: 18,
             ),
           AreaSelectionOverlay(

@@ -8,9 +8,9 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:terrascope/models/analysis_result.dart';
-import 'package:terrascope/models/land_use_result.dart';
-import 'package:terrascope/widgets/before_after_compare.dart';
+import 'package:ubiquitous_eye/models/analysis_result.dart';
+import 'package:ubiquitous_eye/models/land_use_result.dart';
+import 'package:ubiquitous_eye/widgets/before_after_compare.dart';
 
 import 'fixtures/analysis_fixture.dart';
 

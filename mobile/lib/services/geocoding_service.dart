@@ -26,7 +26,7 @@ class GeocodingService {
 
   // Nominatim's usage policy requires an identifying User-Agent.
   static const Map<String, String> _headers = {
-    'User-Agent': 'TerraScope/1.0 (flutter sample app)',
+    'User-Agent': 'UbiquitousEye/1.0 (flutter app)',
   };
 
   Future<List<PlaceResult>> search(String query) async {

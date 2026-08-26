@@ -5,11 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
-import 'package:terrascope/models/analysis_result.dart';
-import 'package:terrascope/models/area_bounds.dart';
-import 'package:terrascope/models/land_use_result.dart';
-import 'package:terrascope/services/analysis_service.dart';
-import 'package:terrascope/widgets/before_after_compare.dart';
+import 'package:ubiquitous_eye/models/analysis_result.dart';
+import 'package:ubiquitous_eye/models/area_bounds.dart';
+import 'package:ubiquitous_eye/models/land_use_result.dart';
+import 'package:ubiquitous_eye/services/analysis_service.dart';
+import 'package:ubiquitous_eye/widgets/before_after_compare.dart';
 
 /// Four distinct 4×3 PNGs. Real encoded images rather than a stub, because the
 /// widgets under test decode them — a placeholder would fail in the rasteriser

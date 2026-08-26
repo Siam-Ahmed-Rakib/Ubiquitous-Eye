@@ -1,5 +1,5 @@
 /// Layout-regression tests: render the app's screens across the device sizes we
-/// support — and at the largest text scale [TerraScopeApp] allows — asserting
+/// support — and at the largest text scale [UbiquitousEyeApp] allows — asserting
 /// nothing overflows.
 ///
 /// Overflow is a *paint-time* error in Flutter: it never throws, it just paints
@@ -10,18 +10,18 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:terrascope/main.dart';
-import 'package:terrascope/models/analytics_service.dart';
-import 'package:terrascope/models/area_bounds.dart';
-import 'package:terrascope/screens/analysis/analysis_run_screen.dart';
-import 'package:terrascope/screens/analysis/land_use_screen.dart';
-import 'package:terrascope/screens/analytics/analytics_image_options_page.dart';
-import 'package:terrascope/screens/analytics/analytics_page.dart';
-import 'package:terrascope/screens/analytics/service_detail_page.dart';
-import 'package:terrascope/screens/area_selection_screen.dart';
-import 'package:terrascope/screens/placeholder_tab.dart';
-import 'package:terrascope/widgets/bottom_nav_bar.dart';
-import 'package:terrascope/widgets/category_filter_bar.dart';
+import 'package:ubiquitous_eye/main.dart';
+import 'package:ubiquitous_eye/models/analytics_service.dart';
+import 'package:ubiquitous_eye/models/area_bounds.dart';
+import 'package:ubiquitous_eye/screens/analysis/analysis_run_screen.dart';
+import 'package:ubiquitous_eye/screens/analysis/land_use_screen.dart';
+import 'package:ubiquitous_eye/screens/analytics/analytics_image_options_page.dart';
+import 'package:ubiquitous_eye/screens/analytics/analytics_page.dart';
+import 'package:ubiquitous_eye/screens/analytics/service_detail_page.dart';
+import 'package:ubiquitous_eye/screens/area_selection_screen.dart';
+import 'package:ubiquitous_eye/screens/placeholder_tab.dart';
+import 'package:ubiquitous_eye/widgets/bottom_nav_bar.dart';
+import 'package:ubiquitous_eye/widgets/category_filter_bar.dart';
 
 /// A small area over Dhaka — the same default the app starts on.
 final AreaBounds _testBounds = AreaBounds.square(
@@ -43,7 +43,7 @@ const Map<String, Size> kSizes = {
   'desktop (1440x900)': Size(1440, 900),
 };
 
-/// 1.0 is the default; 1.3 is the ceiling `TerraScopeApp` clamps OS text
+/// 1.0 is the default; 1.3 is the ceiling `UbiquitousEyeApp` clamps OS text
 /// scaling to, so it is the worst case any user can actually produce.
 const List<double> kTextScales = [1.0, 1.3];
 
@@ -239,6 +239,6 @@ void main() {
 
   _expectNoOverflowAnywhere(
     'App shell',
-    () => const TerraScopeApp(),
+    () => const UbiquitousEyeApp(),
   );
 }

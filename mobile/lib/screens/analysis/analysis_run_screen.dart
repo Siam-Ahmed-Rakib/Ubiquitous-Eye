@@ -298,12 +298,12 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
               children: [
                 TileLayer(
                   urlTemplate: _imageryUrl,
-                  userAgentPackageName: 'com.terrascope.app',
+                  userAgentPackageName: 'com.ubiquitouseye.app',
                   maxNativeZoom: 18,
                 ),
                 TileLayer(
                   urlTemplate: _labelsUrl,
-                  userAgentPackageName: 'com.terrascope.app',
+                  userAgentPackageName: 'com.ubiquitouseye.app',
                   maxNativeZoom: 18,
                 ),
                 PolygonLayer(

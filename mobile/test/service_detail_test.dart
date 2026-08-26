@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:terrascope/models/analytics_service.dart';
-import 'package:terrascope/screens/analytics/service_detail_page.dart';
+import 'package:ubiquitous_eye/models/analytics_service.dart';
+import 'package:ubiquitous_eye/screens/analytics/service_detail_page.dart';
 
 final _service =
     kAnalyticsServices.firstWhere((s) => s.id == 'land_use_classification');
