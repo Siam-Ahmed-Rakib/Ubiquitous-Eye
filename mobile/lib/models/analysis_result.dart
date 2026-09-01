@@ -41,20 +41,29 @@ class ChangePoint {
 /// Aggregate counts for one analysis run (mirrors the backend `stats` object).
 class AnalysisStats {
   final int totalPixels;
+
+  /// Pixels meeting the clear-observation requirement on both dates. Null when
+  /// talking to an older backend that did not report data quality separately.
+  final int? eligiblePixels;
+  final int uncertainPixels;
+  final int minimumClearObservations;
+
   final int deforestation;
   final int waterLoss;
   final String oldDate;
   final String newDate;
 
-  /// The days each composite actually covers (e.g. `1–15 Jan 2025`). Change
-  /// detection reads only the first half of the picked month, so the scenes are
-  /// a narrower window than the month label implies — worth saying out loud.
+  /// The days each composite actually covers. Normally this is the full picked
+  /// month; it can include adjacent dates when cloud forces adaptive expansion.
   /// Empty when talking to a backend that predates the field.
   final String oldWindow;
   final String newWindow;
 
   const AnalysisStats({
     required this.totalPixels,
+    this.eligiblePixels,
+    this.uncertainPixels = 0,
+    this.minimumClearObservations = 0,
     required this.deforestation,
     required this.waterLoss,
     required this.oldDate,
@@ -65,6 +74,10 @@ class AnalysisStats {
 
   factory AnalysisStats.fromJson(Map<String, dynamic> json) => AnalysisStats(
         totalPixels: (json['totalPixels'] as num?)?.toInt() ?? 0,
+        eligiblePixels: (json['eligiblePixels'] as num?)?.toInt(),
+        uncertainPixels: (json['uncertainPixels'] as num?)?.toInt() ?? 0,
+        minimumClearObservations:
+            (json['minimumClearObservations'] as num?)?.toInt() ?? 0,
         deforestation: (json['deforestation'] as num?)?.toInt() ?? 0,
         waterLoss: (json['waterLoss'] as num?)?.toInt() ?? 0,
         oldDate: json['oldDate']?.toString() ?? '',
@@ -135,8 +148,7 @@ class AnalysisResult {
   });
 
   int get deforestationCount =>
-      stats?.deforestation ??
-      changes.where((c) => c.isDeforestation).length;
+      stats?.deforestation ?? changes.where((c) => c.isDeforestation).length;
 
   int get waterLossCount =>
       stats?.waterLoss ?? changes.where((c) => c.isWaterLoss).length;
@@ -152,8 +164,7 @@ class AnalysisResult {
   bool get hasClassMaps => oldClassPng != null && newClassPng != null;
 
   /// Whether a changed-pixel raster exists to draw the difference view from.
-  bool get hasChangeRasters =>
-      deforestationPng != null || waterLossPng != null;
+  bool get hasChangeRasters => deforestationPng != null || waterLossPng != null;
 
   /// Shape of the rasters. Guarded so a malformed response can't divide by zero.
   double get aspectRatio =>

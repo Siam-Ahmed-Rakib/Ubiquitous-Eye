@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +32,9 @@ from sentinelhub import (
 )
 
 from bimonthly_composite import (
-    determine_half,
+    MAX_ADAPTIVE_WINDOW_DAYS,
+    MIN_CLEAR_OBSERVATIONS,
+    adaptive_windows,
     fetch_true_color_base,
     month_range,
     run_composite_pipeline,
@@ -184,9 +186,12 @@ CHANGE_RASTER_PX = 768
 # stretched independently, so the same ground took a different colour on each
 # side. v5 retires v4, which predates the per-date land-cover class maps — the
 # before/after view now offers them as a toggle, and an entry without them would
-# serve a view whose main control does nothing. Bump again whenever the response
-# shape or the rendering changes.
-ANALYZE_CACHE_KIND = "analyze_v5"
+# serve a view whose main control does nothing. v6 retires v5's transition-list
+# loss detection in favour of directional previous-minus-current class presence.
+# v7 requires two clear observations per date and uses adaptive full-month
+# composites, so v6 results do not carry the reliability information now needed.
+# Bump again whenever the response shape, rendering, or detection semantics change.
+ANALYZE_CACHE_KIND = "analyze_v7"
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -620,10 +625,24 @@ def analyze_change():
         lats = [float(pt[1]) for pt in polygon]
         bbox_bounds = (min(lons), min(lats), max(lons), max(lats))
         date_key = f"{old_year}-{old_month:02d}_{new_year}-{new_month:02d}"
-        is_current = (
-            (old_year, old_month) == (now.year, now.month)
-            or (new_year, new_month) == (now.year, now.month)
-        )
+        today = now.date()
+
+        def window_can_receive_new_imagery(year: int, month: int) -> bool:
+            start, end = month_range(year, month)
+            if start > today:
+                raise ValueError("Analysis dates cannot be in the future")
+            end = min(end, today)
+            _, possible_end = adaptive_windows(
+                start,
+                end,
+                MAX_ADAPTIVE_WINDOW_DAYS,
+                available_through=today,
+            )[-1]
+            return possible_end >= today
+
+        old_window_is_current = window_can_receive_new_imagery(old_year, old_month)
+        new_window_is_current = window_can_receive_new_imagery(new_year, new_month)
+        is_current = old_window_is_current or new_window_is_current
 
         cached = cache_get(ANALYZE_CACHE_KIND, date_key, bbox_bounds, is_current)
         if cached is not None:
@@ -647,11 +666,24 @@ def analyze_change():
 
         # ── Old date composite ──
         logger.info("[%s] Running composite pipeline for OLD date %d-%02d", request_id, old_year, old_month)
-        old_df = run_composite_pipeline(polygon, old_year, old_month, client_id, client_secret)
+        old_df = run_composite_pipeline(
+            polygon, old_year, old_month, client_id, client_secret,
+            whole_month=True,
+            min_clear_observations=MIN_CLEAR_OBSERVATIONS,
+            max_window_days=MAX_ADAPTIVE_WINDOW_DAYS,
+        )
 
         # ── New date composite ──
         logger.info("[%s] Running composite pipeline for NEW date %d-%02d", request_id, new_year, new_month)
-        new_df = run_composite_pipeline(polygon, new_year, new_month, client_id, client_secret)
+        new_df = run_composite_pipeline(
+            polygon, new_year, new_month, client_id, client_secret,
+            whole_month=True,
+            min_clear_observations=MIN_CLEAR_OBSERVATIONS,
+            max_window_days=MAX_ADAPTIVE_WINDOW_DAYS,
+        )
+
+        old_window = _composite_window(old_df, old_year, old_month)
+        new_window = _composite_window(new_df, new_year, new_month)
 
         # ── Classification ──
         logger.info("[%s] Running classification on old_df (%d rows) and new_df (%d rows)",
@@ -678,8 +710,26 @@ def analyze_change():
                 results.append(expanded)
 
             if not results:
-                return pd.DataFrame(columns=["Longitude", "Latitude", "classifier"])
-            return pd.concat(results, ignore_index=True)
+                return pd.DataFrame(columns=[
+                    "Longitude", "Latitude", "classifier", "ClearObservationCount",
+                ])
+
+            labels = pd.concat(results, ignore_index=True)
+            if "ClearObservationCount" in df.columns:
+                quality = df[[
+                    "Longitude", "Latitude", "ClearObservationCount",
+                ]]
+                labels = labels.merge(
+                    quality,
+                    on=["Longitude", "Latitude"],
+                    how="left",
+                    validate="one_to_one",
+                )
+            else:
+                # Compatibility for synthetic/legacy callers. The production
+                # composite always supplies the measured count.
+                labels["ClearObservationCount"] = MIN_CLEAR_OBSERVATIONS
+            return labels
 
         prev_df = classify_df(old_df)
         curr_df = classify_df(new_df)
@@ -714,10 +764,18 @@ def analyze_change():
 
         mask_df = get_mask(prev_aligned, curr_aligned)
 
-        # Filter to only changed pixels (mask != 0)
-        changed = mask_df[mask_df["mask"] != 0]
-        logger.info("[%s] Changed pixels: %d (mask=1: %d, mask=2: %d)",
-                     request_id, len(changed),
+        # A loss is reportable only where both dates were built from at least
+        # two clear observations. Persistent cloud remains explicitly uncertain
+        # instead of being forced into a land-cover transition.
+        reliable = (
+            merged["ClearObservationCount_prev"].fillna(0).ge(MIN_CLEAR_OBSERVATIONS)
+            & merged["ClearObservationCount_curr"].fillna(0).ge(MIN_CLEAR_OBSERVATIONS)
+        )
+        changed = mask_df[(mask_df["mask"] != 0) & reliable.to_numpy()]
+        eligible_pixels = int(reliable.sum())
+        uncertain_pixels = int(len(merged) - eligible_pixels)
+        logger.info("[%s] Reliable pixels: %d/%d; changed: %d (mask=1: %d, mask=2: %d)",
+                     request_id, eligible_pixels, len(merged), len(changed),
                      int((changed["mask"] == 1).sum()),
                      int((changed["mask"] == 2).sum()))
 
@@ -739,7 +797,7 @@ def analyze_change():
                 old_image_b64, new_image_b64, base_w, base_h, old_scene, new_scene,
             ) = _before_after_pngs(
                 polygon, old_year, old_month, new_year, new_month,
-                client_id, client_secret,
+                client_id, client_secret, old_window, new_window,
             )
             logger.info("[%s] before/after imagery: %dx%d", request_id, base_w, base_h)
         except Exception as exc:  # pragma: no cover - network/credentials dependent
@@ -805,14 +863,19 @@ def analyze_change():
             "classBreakdown": {"old": old_classes, "new": new_classes},
             "stats": {
                 "totalPixels": len(merged),
+                "eligiblePixels": eligible_pixels,
+                "uncertainPixels": uncertain_pixels,
+                "minimumClearObservations": MIN_CLEAR_OBSERVATIONS,
                 "deforestation": int((changed["mask"] == 1).sum()),
                 "waterLoss": int((changed["mask"] == 2).sum()),
                 "oldDate": f"{old_year}-{old_month:02d}",
                 "newDate": f"{new_year}-{new_month:02d}",
-                # The days each composite actually covers — narrower than the
-                # month the picker implies.
-                "oldWindow": _window_label(old_year, old_month),
-                "newWindow": _window_label(new_year, new_month),
+                "oldWindow": _window_label(*old_window),
+                "newWindow": _window_label(*new_window),
+                "oldWindowStart": old_window[0].isoformat(),
+                "oldWindowEnd": old_window[1].isoformat(),
+                "newWindowStart": new_window[0].isoformat(),
+                "newWindowEnd": new_window[1].isoformat(),
             },
             "requestId": request_id,
         }
@@ -982,15 +1045,28 @@ def _render_true_color(sub: pd.DataFrame, height: int, width: int) -> Image.Imag
     return _stretch_true_color(bands, valid)
 
 
-def _window_label(year: int, month: int, whole_month: bool = False) -> str:
-    """Human label for the days a composite actually covers, e.g. "1–15 Jan 2025".
+def _composite_window(df: pd.DataFrame, year: int, month: int) -> tuple[date, date]:
+    """Read the actual adaptive window, falling back to the requested month."""
+    start = df.attrs.get("window_start")
+    end = df.attrs.get("window_end")
+    if isinstance(start, date) and isinstance(end, date):
+        return start, end
+    return month_range(year, month)
 
-    A month picker implies the whole month, but change detection only composites
-    the first half of it. Saying so on screen stops the imagery looking like it
-    is off-date when it is simply a narrower window than the label suggested.
-    """
-    start, end = month_range(year, month) if whole_month else determine_half(year, month)
-    return f"{start.day}–{end.day} {start.strftime('%b')} {start.year}"
+
+def _window_label(start: date, end: date) -> str:
+    """Human label for an exact composite window, including adjacent months."""
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.day}–{end.day} {start.strftime('%b')} {start.year}"
+    if start.year == end.year:
+        return (
+            f"{start.day} {start.strftime('%b')}–"
+            f"{end.day} {end.strftime('%b')} {start.year}"
+        )
+    return (
+        f"{start.day} {start.strftime('%b')} {start.year}–"
+        f"{end.day} {end.strftime('%b')} {end.year}"
+    )
 
 
 def _change_raster_shape(west: float, south: float, east: float, north: float) -> tuple[int, int]:
@@ -1312,11 +1388,13 @@ def _before_after_pngs(
     new_month: int,
     client_id: str,
     client_secret: str,
+    old_window: tuple[date, date],
+    new_window: tuple[date, date],
 ) -> tuple[str, str, int, int, Image.Image, Image.Image]:
     """Fetch both dates' scenes and render them through one shared stretch.
 
-    ``whole_month=False`` matches the composites change detection reads (days
-    1-15), so the picture covers the period the numbers came from.
+    Each RGB mosaic uses the exact full/adaptively-expanded window that produced
+    its model composite, so the picture and detection read the same dates.
 
     Returns ``(old_b64, new_b64, width, height, old_img, new_img)``. The rendered
     images come back alongside the encoded ones so the class maps can be shaded
@@ -1325,10 +1403,12 @@ def _before_after_pngs(
     is optional.
     """
     old_rgb, old_valid = fetch_true_color_base(
-        polygon, old_year, old_month, client_id, client_secret, whole_month=False,
+        polygon, old_year, old_month, client_id, client_secret,
+        date_window=old_window,
     )
     new_rgb, new_valid = fetch_true_color_base(
-        polygon, new_year, new_month, client_id, client_secret, whole_month=False,
+        polygon, new_year, new_month, client_id, client_secret,
+        date_window=new_window,
     )
 
     low, high = _joint_stretch_bounds([(old_rgb, old_valid), (new_rgb, new_valid)])
@@ -1525,7 +1605,13 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
     ratio = (sub_area / full_area) if full_area > 0 else 0.0
 
     stats = dict(full_stats)
-    stats["totalPixels"] = max(int(round(full_total * ratio)), len(changes))
+    sub_total = max(int(round(full_total * ratio)), len(changes))
+    stats["totalPixels"] = sub_total
+    if "eligiblePixels" in full_stats:
+        full_eligible = int(full_stats.get("eligiblePixels", 0))
+        sub_eligible = max(int(round(full_eligible * ratio)), len(changes))
+        stats["eligiblePixels"] = min(sub_eligible, sub_total)
+        stats["uncertainPixels"] = sub_total - stats["eligiblePixels"]
     stats["deforestation"] = deforestation
     stats["waterLoss"] = water_loss
 

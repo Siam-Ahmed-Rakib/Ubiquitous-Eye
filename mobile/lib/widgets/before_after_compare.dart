@@ -172,7 +172,9 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
                   ),
                   Text(
                     available
-                        ? (_showingClasses ? 'Coloured by class' : 'Raw imagery')
+                        ? (_showingClasses
+                            ? 'Coloured by class'
+                            : 'Raw imagery')
                         : 'Unavailable for this run',
                     style: const TextStyle(fontSize: 11.5, color: _muted),
                   ),
@@ -261,7 +263,9 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
           // without the per-pixel list, and a panel captioned "1205" over the
           // words "no change" is worse than either message alone.
           overlay: (deforestation == 0 && waterLoss == 0)
-              ? const _NoChangeOverlay()
+              ? _NoChangeOverlay(
+                  uncertainPixels: result.stats?.uncertainPixels ?? 0,
+                )
               : null,
           children: [
             if (base != null)
@@ -312,6 +316,19 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
             ),
           ],
         ),
+        if ((result.stats?.uncertainPixels ?? 0) > 0) ...[
+          const SizedBox(height: 10),
+          Text(
+            '${result.stats!.uncertainPixels} pixels were excluded: one or both '
+            'dates had fewer than ${result.stats!.minimumClearObservations} '
+            'clear observations.',
+            style: const TextStyle(
+              fontSize: 11.5,
+              height: 1.35,
+              color: Color(0xFF9A5B00),
+            ),
+          ),
+        ],
         const SizedBox(height: 10),
         const Text(
           'Tap a colour to show or hide it. Pinch or scroll any picture to '
@@ -643,22 +660,29 @@ class _ChangeChip extends StatelessWidget {
 /// Shown over the difference picture when the two dates came back identical —
 /// an empty black frame reads as a failure, and this one is a real result.
 class _NoChangeOverlay extends StatelessWidget {
-  const _NoChangeOverlay();
+  final int uncertainPixels;
+
+  const _NoChangeOverlay({required this.uncertainPixels});
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
+    final uncertain = uncertainPixels > 0;
+    return Center(
       child: Padding(
-        padding: EdgeInsets.all(16),
+        padding: const EdgeInsets.all(16),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.check_circle_outline, size: 26, color: Colors.white70),
-            SizedBox(height: 8),
+            Icon(
+              uncertain ? Icons.cloud_outlined : Icons.check_circle_outline,
+              size: 26,
+              color: Colors.white70,
+            ),
+            const SizedBox(height: 8),
             Text(
-              'No change detected',
+              uncertain ? 'No confirmed change' : 'No change detected',
               textAlign: TextAlign.center,
-              style: TextStyle(
+              style: const TextStyle(
                 color: Colors.white,
                 fontSize: 13,
                 fontWeight: FontWeight.w600,

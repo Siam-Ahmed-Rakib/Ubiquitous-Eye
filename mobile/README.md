@@ -81,9 +81,12 @@ Uses the **same** `POST /api/sentinel/analyze` endpoint the React web
    area of interest*).
 2. Tap **CONTINUE** → the **Change Analysis** screen.
 3. Choose an *older* and a *newer* month, then **RUN ANALYSIS**.
-4. The backend builds bimonthly Sentinel-2 composites for both dates, classifies
-   them, and returns the changed pixels — **red = deforestation** (`mask 1`),
-   **orange = water loss** (`mask 2`) — with pixel-count stats below.
+4. For each date, the backend starts with every Sentinel-2 and Landsat pass in
+   the selected month. If any pixel has fewer than two clear observations, the
+   window expands around that month (first by 15 days, then up to 60 total
+   days). Only pixels with at least two clear observations on **both** dates can
+   report a change; the rest are shown as cloud-uncertain. Reported pixels are
+   **red = deforestation** (`mask 1`) and **orange = water loss** (`mask 2`).
 
 #### Before / after comparison
 
@@ -140,9 +143,9 @@ the other identically and the two always show the same ground.
 > the imagery is the entire cost. The Sentinel Hub fetches still dominate the
 > wall-clock time either way.
 
-Because the cached response shape changed, `ANALYZE_CACHE_KIND` in
-`server/api_server.py` is `analyze_v2`; entries written before the imagery
-existed no longer match and are simply recomputed.
+`ANALYZE_CACHE_KIND` in `server/api_server.py` is versioned whenever response
+shape or detection semantics change. It is currently `analyze_v7`, so cached
+results from the old half-month/non-gated detector are never reused.
 
 Relevant code:
 [`lib/services/analysis_service.dart`](lib/services/analysis_service.dart) (HTTP),

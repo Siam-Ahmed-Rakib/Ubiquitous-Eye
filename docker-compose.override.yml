@@ -8,10 +8,9 @@ services:
     ports: !override
       - "5001:5000"
 
-  # Host port 8080 is taken by another project too (a WordPress stack), so the
-  # site is served on 8081. Container-side is still 80. BACKEND_URL is baked
-  # into the JS bundle at build time, so it has to match the host-side
-  # backend port above (5001), not the in-container one.
+  # Optional standalone Nginx frontend (`--profile standalone-frontend`). Host
+  # port 8080 is taken by another project, so expose it on 8081. The default
+  # Compose run serves the same Flutter UI directly from the backend on 5001.
   frontend:
     build:
       args:

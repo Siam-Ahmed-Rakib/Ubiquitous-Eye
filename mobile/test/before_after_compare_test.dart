@@ -65,6 +65,9 @@ Map<String, dynamic> _fullBody() => {
       },
       'stats': {
         'totalPixels': 1000,
+        'eligiblePixels': 998,
+        'uncertainPixels': 2,
+        'minimumClearObservations': 2,
         'deforestation': 2,
         'waterLoss': 1,
         'oldDate': '2024-01',
@@ -129,6 +132,9 @@ void main() {
       // The story the two dates tell: forest down, bare soil up.
       expect(result.oldClasses.first.percent, 70.0);
       expect(result.newClasses.first.percent, 40.0);
+      expect(result.stats?.eligiblePixels, 998);
+      expect(result.stats?.uncertainPixels, 2);
+      expect(result.stats?.minimumClearObservations, 2);
     });
 
     test('a response without class maps still parses', () async {
@@ -273,6 +279,12 @@ void main() {
       expect(find.text('CHANGE'), findsOneWidget);
       expect(find.text('Deforestation · 2'), findsOneWidget);
       expect(find.text('Water loss · 1'), findsOneWidget);
+      expect(
+        find.text(
+          '2 pixels were excluded: one or both dates had fewer than 2 clear observations.',
+        ),
+        findsOneWidget,
+      );
     });
 
     testWidgets('a change class can be hidden without affecting the other',
@@ -281,7 +293,9 @@ void main() {
       await _pump(tester, result);
 
       Finder maskFor(Uint8List bytes) => find.byWidgetPredicate(
-            (w) => w is Image && w.image is MemoryImage &&
+            (w) =>
+                w is Image &&
+                w.image is MemoryImage &&
                 (w.image as MemoryImage).bytes == bytes,
           );
 
@@ -320,7 +334,7 @@ void main() {
         };
       await _pump(tester, await _analyze(body));
 
-      expect(find.text('No change detected'), findsOneWidget);
+      expect(find.text('No confirmed change'), findsOneWidget);
       expect(find.text('Deforestation · none'), findsOneWidget);
       expect(find.text('Water loss · none'), findsOneWidget);
     });

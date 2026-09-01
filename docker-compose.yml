@@ -13,7 +13,7 @@ services:
     volumes:
       - ./server/GRANULE:/app/GRANULE
       # NOT ./Frontend/dist:/app/frontend_dist -- server/Dockerfile builds the
-      # React app in its own stage and copies the result to /app/frontend_dist.
+      # Flutter app in its own stage and copies the result to /app/frontend_dist.
       # Mounting the host path over it shadowed the built copy with an empty
       # directory (.dockerignore excludes Frontend/dist precisely because the
       # host copy is meant to be discarded), so the backend served no UI at all
@@ -23,6 +23,11 @@ services:
     restart: unless-stopped
 
   frontend:
+    # The backend already serves the Flutter UI. Keep this separate Nginx image
+    # opt-in so the default `docker compose up --build` does not compile Flutter
+    # twice. Enable with: docker compose --profile standalone-frontend up --build
+    profiles:
+      - standalone-frontend
     build:
       context: .
       dockerfile: mobile.Dockerfile

@@ -99,8 +99,8 @@ def get_mask(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
     Compare two time-step DataFrames (from ensemble_predict) and produce a change mask.
 
     Mask values:
-        1 — Tree changed to Soil or Building (deforestation)
-        2 — Water changed to Soil, Building, or Tree (water loss)
+        1 — Tree was present previously and is absent currently (deforestation)
+        2 — Water was present previously and is absent currently (water loss)
         0 — No significant change
     """
     mask = np.zeros(len(prev_df), dtype=int)
@@ -108,11 +108,14 @@ def get_mask(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
     prev = prev_df["classifier"]
     curr = curr_df["classifier"]
 
-    # Tree → Soil or Building
-    mask[(prev == "Tree") & (curr.isin(["Soil", "Building"]))] = 1
+    # Subtract the current presence flag from the previous one. A delta of 1
+    # means the class was present before and is absent now (loss); 0 means no
+    # change and -1 means a gain, neither of which is a loss.
+    tree_delta = prev.eq("Tree").astype(np.int8) - curr.eq("Tree").astype(np.int8)
+    water_delta = prev.eq("Water").astype(np.int8) - curr.eq("Water").astype(np.int8)
 
-    # Water → Soil, Building, or Tree
-    mask[(prev == "Water") & (curr.isin(["Soil", "Building", "Tree"]))] = 2
+    mask[tree_delta == 1] = 1
+    mask[water_delta == 1] = 2
 
     result = prev_df[["Longitude", "Latitude"]].copy()
     result["mask"] = mask

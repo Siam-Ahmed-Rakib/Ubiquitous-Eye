@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import calendar
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -163,8 +163,18 @@ function evaluatePixel(samples) {
 
 BAND_NAMES = ["B01", "B02", "B03", "B04", "B08", "B11", "B12"]
 CLOUD_SCL_VALUES = [3, 8, 9, 10]
-CLOUD_BQA_MASK = 2 | 4 | 8 | 16
+# A clear observation must also contain real, unsaturated data. SCL 0/1 are not
+# clouds, but counting either as clear would let an empty pixel pass the quality
+# gate. Landsat QA bit 0 is the equivalent fill/no-data flag.
+INVALID_S2_SCL_VALUES = [0, 1, *CLOUD_SCL_VALUES]
+CLOUD_BQA_MASK = 1 | 2 | 4 | 8 | 16
 RESOLUTION = 30  # metres
+
+# Change detection starts with the selected calendar month, then grows the
+# window evenly around it only when some pixels still lack enough clear looks.
+MIN_CLEAR_OBSERVATIONS = 2
+ADAPTIVE_EXPANSION_DAYS = 15
+MAX_ADAPTIVE_WINDOW_DAYS = 60
 
 SCL_CLASS_DICT = {
     0: "No Data", 1: "Saturated", 2: "Dark Area Pixels",
@@ -228,6 +238,45 @@ def month_range(year: int, month: int) -> tuple[date, date]:
     return start, end
 
 
+def adaptive_windows(
+    start: date,
+    end: date,
+    max_days: int = MAX_ADAPTIVE_WINDOW_DAYS,
+    available_through: date | None = None,
+) -> list[tuple[date, date]]:
+    """Return the base window followed by balanced expansions up to ``max_days``.
+
+    The first expansion adds 15 total days. The last reaches the cap exactly,
+    avoiding an unnecessary one-day final attempt for February.
+    """
+    base_days = (end - start).days + 1
+    if max_days < base_days:
+        raise ValueError("max_days cannot be shorter than the base date window")
+
+    targets = [base_days]
+    if base_days < max_days:
+        targets.append(min(base_days + ADAPTIVE_EXPANSION_DAYS, max_days))
+    if targets[-1] < max_days:
+        targets.append(max_days)
+
+    windows = []
+    for target_days in targets:
+        extra = target_days - base_days
+        before = extra // 2
+        after = extra - before
+        window_start = start - timedelta(days=before)
+        window_end = end + timedelta(days=after)
+        if available_through is not None and window_end > available_through:
+            # There are no future acquisitions. Move that unavailable part to
+            # the beginning so a current-month request still gets the intended
+            # number of real calendar days rather than an empty future half.
+            unavailable_days = (window_end - available_through).days
+            window_start -= timedelta(days=unavailable_days)
+            window_end = available_through
+        windows.append((window_start, window_end))
+    return windows
+
+
 def search_dates(collection, bbox, start, end, catalog_cfg):
     catalog = SentinelHubCatalog(config=catalog_cfg)
     results = list(catalog.search(
@@ -258,8 +307,8 @@ def fetch_s2(date_str, bbox, size, config):
     bands = resp["bands.tif"].astype(np.float32)
     scl = resp["scl.tif"]
     scl = scl[:, :, 0] if scl.ndim == 3 else scl
-    cloud = np.isin(scl, CLOUD_SCL_VALUES)
-    return bands, cloud, scl
+    invalid = np.isin(scl, INVALID_S2_SCL_VALUES)
+    return bands, invalid, scl
 
 
 def fetch_landsat(date_str, bbox, size, config):
@@ -310,6 +359,7 @@ def fetch_true_color_base(
     target_resolution: int = 10,
     max_px: int = 1536,
     whole_month: bool = True,
+    date_window: tuple[date, date] | None = None,
 ):
     """Fetch a sharp, cloud-free Sentinel-2 true-colour scene for the AOI bbox.
 
@@ -319,10 +369,10 @@ def fetch_true_color_base(
     (see EVALSCRIPT_TRUE_COLOR), so the backdrop under the mask is crisp and
     cloud-free rather than a blown-up 30 m composite.
 
-    ``whole_month`` must match the ``run_composite_pipeline`` call this scene
-    illustrates, or the picture shows a different period than the analysis read:
-    land-use classification composites the whole month, change detection only
-    days 1-15.
+    ``date_window`` takes precedence when the analysis adaptively expanded its
+    month. Otherwise ``whole_month`` selects a calendar month or legacy days
+    1-15. Keeping these aligned prevents the picture and model from reading
+    different periods.
 
     Returns ``(rgb, valid)`` where ``rgb`` is H×W×3 float32 in [B04, B03, B02]
     order and ``valid`` is an H×W bool mask (False = cloud / no clear pixel).
@@ -332,7 +382,10 @@ def fetch_true_color_base(
     bbox = BBox((min(lons), min(lats), max(lons), max(lats)), crs=CRS.WGS84)
     size = _true_color_size(bbox, target_resolution, max_px)
 
-    start, end = month_range(year, month) if whole_month else determine_half(year, month)
+    if date_window is not None:
+        start, end = date_window
+    else:
+        start, end = month_range(year, month) if whole_month else determine_half(year, month)
     logger.info("True-colour window: %s -> %s (whole_month=%s)", start, end, whole_month)
     cfg = build_s2_config(client_id, client_secret)
 
@@ -358,43 +411,133 @@ def fetch_true_color_base(
     return rgb, valid
 
 
-def collect_half(half_start, half_end, bbox, aoi_size, s2_cfg, ls_catalog_cfg, ls_cfg):
-    """Fetch all S2 + Landsat images for a date range and return stacks."""
-    logger.info("Collecting images: %s -> %s", half_start, half_end)
-
-    band_stack = []
-    scl_stack = []
-
-    # Sentinel-2
-    s2_dates = search_dates(DataCollection.SENTINEL2_L2A, bbox, half_start, half_end, s2_cfg)
+def _extend_collection(
+    start: date,
+    end: date,
+    s2_dates: list[str],
+    ls_dates: list[str],
+    bbox,
+    aoi_size,
+    s2_cfg,
+    ls_cfg,
+    band_stack: list[np.ndarray],
+    scl_stack: list[np.ndarray],
+    fetched_s2: set[str],
+    fetched_ls: set[str],
+) -> None:
+    """Fetch newly eligible acquisition dates, without downloading any twice."""
     for ds in s2_dates:
+        scene_date = date.fromisoformat(ds)
+        if not start <= scene_date <= end or ds in fetched_s2:
+            continue
         try:
-            bands, cloud, scl = fetch_s2(ds, bbox, aoi_size, s2_cfg)
-            masked = apply_cloud_mask(bands, cloud)
-            cpct = 100 * np.mean(cloud)
+            bands, invalid, scl = fetch_s2(ds, bbox, aoi_size, s2_cfg)
+            masked = apply_cloud_mask(bands, invalid)
+            cpct = 100 * np.mean(invalid)
             band_stack.append(masked)
             scl_stack.append(scl)
-            logger.info("  S2 %s  cloud: %.1f%%", ds, cpct)
+            fetched_s2.add(ds)
+            logger.info("  S2 %s  cloud/no-data: %.1f%%", ds, cpct)
         except Exception as e:
             logger.warning("  S2 %s skipped: %s", ds, e)
 
-    # Landsat
-    ls_dates = search_dates(DataCollection.LANDSAT_OT_L2, bbox, half_start, half_end, ls_catalog_cfg)
     for ds in ls_dates:
+        scene_date = date.fromisoformat(ds)
+        if not start <= scene_date <= end or ds in fetched_ls:
+            continue
         try:
             bands, cloud = fetch_landsat(ds, bbox, aoi_size, ls_cfg)
             masked = apply_cloud_mask(bands, cloud)
             cpct = 100 * np.mean(cloud)
             band_stack.append(masked)
-            logger.info("  LS %s  cloud: %.1f%%", ds, cpct)
+            fetched_ls.add(ds)
+            logger.info("  LS %s  cloud/no-data: %.1f%%", ds, cpct)
         except Exception as e:
             logger.warning("  LS %s skipped: %s", ds, e)
+
+
+def collect_half(half_start, half_end, bbox, aoi_size, s2_cfg, ls_catalog_cfg, ls_cfg):
+    """Fetch all S2 + Landsat images for a fixed date range and return stacks."""
+    logger.info("Collecting images: %s -> %s", half_start, half_end)
+
+    band_stack: list[np.ndarray] = []
+    scl_stack: list[np.ndarray] = []
+    s2_dates = search_dates(DataCollection.SENTINEL2_L2A, bbox, half_start, half_end, s2_cfg)
+    ls_dates = search_dates(DataCollection.LANDSAT_OT_L2, bbox, half_start, half_end, ls_catalog_cfg)
+    _extend_collection(
+        half_start, half_end, s2_dates, ls_dates, bbox, aoi_size, s2_cfg, ls_cfg,
+        band_stack, scl_stack, set(), set(),
+    )
 
     if not band_stack:
         raise RuntimeError(f"No images collected for {half_start} -> {half_end}")
 
     logger.info("Total images: %d (S2 SCL scenes: %d)", len(band_stack), len(scl_stack))
     return band_stack, scl_stack
+
+
+def clear_observation_count(band_stack: list[np.ndarray]) -> np.ndarray:
+    """Number of fully valid seven-band observations contributing per pixel."""
+    stacked = np.stack(band_stack, axis=0)
+    return np.all(np.isfinite(stacked), axis=-1).sum(axis=0).astype(np.uint16)
+
+
+def collect_adaptive(
+    base_start,
+    base_end,
+    bbox,
+    aoi_size,
+    s2_cfg,
+    ls_catalog_cfg,
+    ls_cfg,
+    min_clear_observations: int = MIN_CLEAR_OBSERVATIONS,
+    max_window_days: int = MAX_ADAPTIVE_WINDOW_DAYS,
+    available_through: date | None = None,
+):
+    """Collect a full month, expanding only until every pixel meets the gate."""
+    windows = adaptive_windows(
+        base_start,
+        base_end,
+        max_window_days,
+        available_through=available_through,
+    )
+    search_start, search_end = windows[-1]
+
+    # Catalog queries are cheap compared with raster downloads. Search the full
+    # possible range once, then fetch only dates admitted by each expansion.
+    s2_dates = search_dates(DataCollection.SENTINEL2_L2A, bbox, search_start, search_end, s2_cfg)
+    ls_dates = search_dates(DataCollection.LANDSAT_OT_L2, bbox, search_start, search_end, ls_catalog_cfg)
+
+    band_stack: list[np.ndarray] = []
+    scl_stack: list[np.ndarray] = []
+    fetched_s2: set[str] = set()
+    fetched_ls: set[str] = set()
+    clear_counts = None
+    used_start, used_end = windows[0]
+
+    for used_start, used_end in windows:
+        logger.info("Adaptive composite attempt: %s -> %s", used_start, used_end)
+        _extend_collection(
+            used_start, used_end, s2_dates, ls_dates, bbox, aoi_size, s2_cfg, ls_cfg,
+            band_stack, scl_stack, fetched_s2, fetched_ls,
+        )
+        if not band_stack:
+            continue
+
+        clear_counts = clear_observation_count(band_stack)
+        meets_gate = clear_counts >= min_clear_observations
+        coverage = 100.0 * float(np.mean(meets_gate))
+        logger.info(
+            "Clear-observation gate: %.1f%% pixels have >=%d looks (%d scenes)",
+            coverage, min_clear_observations, len(band_stack),
+        )
+        if bool(np.all(meets_gate)):
+            break
+
+    if not band_stack or clear_counts is None:
+        raise RuntimeError(f"No images collected for {search_start} -> {search_end}")
+
+    return band_stack, scl_stack, clear_counts, used_start, used_end
 
 
 def make_composite(band_stack):
@@ -429,7 +572,7 @@ def resample_30m_to_10m(composite, bbox, size_30m):
     return resampled, lons_10, lats_10
 
 
-def build_dataframe(composite, scl_stack, bbox, aoi_size):
+def build_dataframe(composite, scl_stack, bbox, aoi_size, clear_counts=None):
     """
     Resample composite to 10 m and build a DataFrame with
     Longitude, Latitude, B01..B12, ClassID, ClassName.
@@ -443,6 +586,10 @@ def build_dataframe(composite, scl_stack, bbox, aoi_size):
     }
     for i, bname in enumerate(BAND_NAMES):
         data[bname] = resampled[:, :, i].flatten()
+
+    if clear_counts is not None:
+        clear_resampled = np.repeat(np.repeat(clear_counts, 3, axis=0), 3, axis=1)
+        data["ClearObservationCount"] = clear_resampled.flatten()
 
     # SCL composite: per-pixel mode across all S2 SCL scenes
     if scl_stack:
@@ -475,13 +622,15 @@ def run_composite_pipeline(
     client_id: str,
     client_secret: str,
     whole_month: bool = False,
+    min_clear_observations: int = 1,
+    max_window_days: int | None = None,
 ) -> pd.DataFrame:
     """
     End-to-end pipeline: polygon + year/month -> resampled 10 m DataFrame.
 
-    With ``whole_month`` (used by land-use classification) it collects every pass
-    in the month so the cloud-masked median composite has enough clear looks to
-    remove clouds. Otherwise it keeps the legacy 1st-half window (days 1-15).
+    With ``whole_month`` it starts with every pass in the selected month.
+    ``max_window_days`` enables balanced adaptive expansion when pixels do not
+    reach ``min_clear_observations``. Otherwise the date range stays fixed.
     """
     lons = [pt[0] for pt in polygon_coords]
     lats = [pt[1] for pt in polygon_coords]
@@ -495,17 +644,40 @@ def run_composite_pipeline(
     half_start, half_end = (
         month_range(year, month) if whole_month else determine_half(year, month)
     )
+    today = datetime.now(timezone.utc).date()
+    if half_start > today:
+        raise ValueError("Cannot build a composite for a future month")
+    half_end = min(half_end, today)
 
     s2_cfg = build_s2_config(client_id, client_secret)
     ls_cat_cfg = build_ls_catalog_config(client_id, client_secret)
     ls_cfg = build_ls_config(client_id, client_secret)
 
-    band_stack, scl_stack = collect_half(
-        half_start, half_end, bbox, aoi_size,
-        s2_cfg, ls_cat_cfg, ls_cfg,
-    )
+    if min_clear_observations < 1:
+        raise ValueError("min_clear_observations must be at least 1")
+
+    if max_window_days is not None:
+        band_stack, scl_stack, clear_counts, used_start, used_end = collect_adaptive(
+            half_start, half_end, bbox, aoi_size, s2_cfg, ls_cat_cfg, ls_cfg,
+            min_clear_observations=min_clear_observations,
+            max_window_days=max_window_days,
+            available_through=today,
+        )
+    else:
+        band_stack, scl_stack = collect_half(
+            half_start, half_end, bbox, aoi_size,
+            s2_cfg, ls_cat_cfg, ls_cfg,
+        )
+        clear_counts = clear_observation_count(band_stack)
+        used_start, used_end = half_start, half_end
+
     composite = make_composite(band_stack)
-    df = build_dataframe(composite, scl_stack, bbox, aoi_size)
+    df = build_dataframe(composite, scl_stack, bbox, aoi_size, clear_counts)
+    df.attrs.update({
+        "window_start": used_start,
+        "window_end": used_end,
+        "minimum_clear_observations": min_clear_observations,
+    })
 
     residual = 100 * np.mean(np.isnan(composite[:, :, 0]))
     logger.info("Composite residual NaN: %.1f%%, df shape: %s", residual, df.shape)

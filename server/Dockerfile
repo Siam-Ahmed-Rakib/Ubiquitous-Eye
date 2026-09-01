@@ -1,12 +1,14 @@
+# syntax=docker/dockerfile:1.7
+
 # The web UI this image serves is the Flutter client in mobile/, not the React
 # app in Frontend/. Both exist; the Flutter one is the product. To go back to
 # React, restore the node:20-alpine stage from git history and repoint the
 # `COPY --from=frontend-builder` line at the runtime stage.
-FROM ghcr.io/cirruslabs/flutter:stable AS frontend-builder
+FROM ghcr.io/cirruslabs/flutter:stable@sha256:46691e311715845de03a3ba4753a475476936805b29431b1f00f1816981033f8 AS frontend-builder
 WORKDIR /app
 
 # Resolve dependencies first so a source-only change reuses this layer.
-COPY mobile/pubspec.yaml ./
+COPY mobile/pubspec.yaml mobile/pubspec.lock ./
 RUN flutter pub get
 
 COPY mobile/ ./
@@ -16,10 +18,9 @@ COPY mobile/ ./
 # hostname here would pin the image to one deployment URL. Set it only to point
 # the UI at a backend somewhere other than the one serving it.
 ARG BACKEND_URL=
-RUN flutter create . --platforms web
 RUN flutter build web --release --dart-define=BACKEND_URL=${BACKEND_URL}
 
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -30,12 +31,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
 
 COPY server/requirements.txt ./
-# --retries/--timeout: this layer pulls ~2 GB of wheels, and the build has twice
-# died partway through with "Name or service not known" *after* several large
-# downloads had already succeeded -- a resolver giving out under load, not DNS
-# being absent. pip's default is 5 retries with a 15 s timeout, which is not
-# enough headroom for a 340 MB wheel on a slow link.
-RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt
+# Keep downloaded wheels in BuildKit's cache. If a slow or unreliable download
+# aborts this step, the next build resumes from the packages already fetched.
+# The cache is not copied into the runtime image.
+RUN --mount=type=cache,id=ubiquitous-eye-pip,target=/root/.cache/pip,sharing=locked \
+    pip install --retries 10 --timeout 120 -r requirements.txt
 
 COPY server/api_server.py ./
 COPY server/bimonthly_composite.py ./

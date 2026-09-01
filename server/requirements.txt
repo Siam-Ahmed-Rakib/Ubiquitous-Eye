@@ -24,7 +24,10 @@ scipy==1.18.0
 # Model stack. See the note above about pickle/version coupling.
 scikit-learn==1.9.0
 joblib==1.5.3
-xgboost==3.3.0
+# The backend runs CPU inference. The full xgboost wheel also installs the large
+# NVIDIA NCCL runtime; xgboost-cpu exposes the same Python module without GPU or
+# federated-learning support.
+xgboost-cpu==3.3.0
 catboost==1.2.10
 lightgbm==4.7.0
 

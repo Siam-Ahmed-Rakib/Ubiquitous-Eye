@@ -265,7 +265,8 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
           foregroundColor: Colors.grey.shade700,
           selectedForegroundColor: Colors.white,
           selectedBackgroundColor: _ink,
-          textStyle: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+          textStyle:
+              const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
         ),
         onSelectionChanged: (s) => setState(() => _view = s.first),
       ),
@@ -431,9 +432,8 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
             child: ResponsiveCenter(
               maxWidth: 720,
               padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
-              child: _result != null
-                  ? _buildResults(_result!)
-                  : _buildControls(),
+              child:
+                  _result != null ? _buildResults(_result!) : _buildControls(),
             ),
           ),
         ),
@@ -455,7 +455,8 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
             Flexible(
               child: Text(
                 '${widget.bounds.areaKm2.toStringAsFixed(2)} km² selected',
-                style: const TextStyle(fontWeight: FontWeight.w700, color: _ink),
+                style:
+                    const TextStyle(fontWeight: FontWeight.w700, color: _ink),
               ),
             ),
           ],
@@ -596,8 +597,14 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
             Expanded(
               child: _StatCard(
                 color: _ink,
-                value: _formatCount(stats?.totalPixels ?? result.changes.length),
-                label: 'Compared\npixels',
+                value: _formatCount(
+                  stats?.eligiblePixels ??
+                      stats?.totalPixels ??
+                      result.changes.length,
+                ),
+                label: stats?.eligiblePixels != null
+                    ? 'Reliable\npixels'
+                    : 'Compared\npixels',
               ),
             ),
           ],
@@ -607,9 +614,24 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
           result.hasChanges
               ? 'Detected ${_formatCount(result.changes.length)} changed pixels, '
                   '${_showingCompare ? 'drawn on the change picture above.' : 'shown on the map above.'}'
-              : 'No change detected between the two dates.',
+              : (stats?.uncertainPixels ?? 0) > 0
+                  ? 'No confirmed change among pixels with enough clear imagery.'
+                  : 'No change detected between the two dates.',
           style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
         ),
+        if ((stats?.uncertainPixels ?? 0) > 0) ...[
+          const SizedBox(height: 8),
+          Text(
+            '${_formatCount(stats!.uncertainPixels)} pixels were excluded because '
+            'one or both dates had fewer than '
+            '${stats.minimumClearObservations} clear observations.',
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.35,
+              color: Colors.orange.shade800,
+            ),
+          ),
+        ],
         const SizedBox(height: 16),
         SizedBox(
           height: 48,
@@ -724,7 +746,8 @@ class _SampleBanner extends StatelessWidget {
       ),
       child: Row(
         children: [
-          const Icon(Icons.science_outlined, size: 18, color: Color(0xFF9A6100)),
+          const Icon(Icons.science_outlined,
+              size: 18, color: Color(0xFF9A6100)),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
