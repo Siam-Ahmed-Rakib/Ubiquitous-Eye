@@ -64,3 +64,11 @@ mangles `/app` into a Windows path and the exec fails with "Cwd must be absolute
   pipefail returns that for the whole pipeline. `curl ... | head -c` is the same bug
   plus `set -e` killing the script. Both shipped in `azure-redeploy.sh` and made a
   healthy deploy look like two failures. Write curl output to a file, then grep the file.
+- **An overlay inside `FlutterMap` loses every touch drag unless you lower its slop.**
+  flutter_map puts Horizontal/VerticalDragGestureRecognizers on a `GestureArenaTeam`
+  that accept at *hit* slop (18 logical px, ~8 on Android) along one axis, while
+  `GestureDetector.onPan*` accepts at *pan* slop -- double that. The map wins every
+  straight finger drag. A mouse collapses both to 1-2 px and the deeper widget accepts
+  first, so **desktop web looks fine while every touch device is broken**. Fix is a
+  scoped `MediaQuery(gestureSettings: DeviceGestureSettings(touchSlop: 2))` around the
+  overlay; see `mobile/lib/widgets/selection_overlay.dart`.

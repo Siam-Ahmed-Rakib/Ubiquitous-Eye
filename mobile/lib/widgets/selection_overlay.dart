@@ -1,5 +1,8 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
+import 'package:flutter/gestures.dart'
+    show DeviceGestureSettings, DragStartBehavior;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 // latlong2 exports its own `Path` type; hide it so `Path` below means dart:ui.Path.
@@ -33,6 +36,12 @@ class AreaSelectionOverlay extends StatelessWidget {
   final VoidCallback onDragEnd;
   final bool locked;
 
+  /// Set false to take the handles out of the widget tree entirely. That
+  /// disposes their gesture recognisers, which hands the pointer back to the
+  /// map. The screen uses it while two or more fingers are down, so a pinch
+  /// that starts inside the box still zooms the map instead of dragging it.
+  final bool gesturesEnabled;
+
   const AreaSelectionOverlay({
     super.key,
     required this.bounds,
@@ -40,17 +49,44 @@ class AreaSelectionOverlay extends StatelessWidget {
     required this.onDragStart,
     required this.onDragEnd,
     this.locked = false,
+    this.gesturesEnabled = true,
   });
 
-  // Visible dot sizes, and the (larger) square each one accepts a drag within.
+  // Visible dot sizes. These do not change with input device.
   static const double _cornerDot = 18;
-  static const double _cornerHit = 44;
   static const double _edgeBarLong = 26;
   static const double _edgeBarShort = 6;
-  static const double _edgeHitLong = 48;
-  static const double _edgeHitShort = 30;
   static const double _centreDot = 34;
-  static const double _centreHit = 52;
+
+  // The (larger) area each dot accepts a drag within. Fingers get bigger
+  // targets than a mouse pointer; `build` then clamps both against the box's
+  // on-screen size so the handles can never swallow a small box.
+  static const double _cornerHitMouse = 44;
+  static const double _cornerHitTouch = 56;
+  static const double _edgeHitLongMouse = 48;
+  static const double _edgeHitLongTouch = 64;
+  static const double _edgeHitShortMouse = 30;
+  static const double _edgeHitShortTouch = 40;
+  static const double _centreHitMouse = 52;
+  static const double _centreHitTouch = 68;
+
+  /// Gesture settings for the handles, and the whole reason the box was
+  /// unusable by touch.
+  ///
+  /// flutter_map registers a Horizontal- and a VerticalDragGestureRecognizer on
+  /// a GestureArenaTeam captained by its ScaleGestureRecognizer. Those accept at
+  /// *hit* slop -- kTouchSlop, 18 logical px (nearer 8 on most Android
+  /// devices) along a single axis. GestureDetector.onPan* accepts at *pan*
+  /// slop, which is twice that: kPanSlop, 36 px of total distance. A straight
+  /// drag therefore crossed the map's threshold long before ours, the map won
+  /// the arena every time, and the box would not move. With a mouse both
+  /// thresholds collapse to 1-2 px and the deeper widget accepts first, which
+  /// is why desktop web always felt fine and only touch was broken.
+  ///
+  /// touchSlop 2 gives the handles a pan slop of 4 px (panSlop is touchSlop x
+  /// 2), comfortably inside the map's threshold on every platform.
+  static const DeviceGestureSettings _handleGestures =
+      DeviceGestureSettings(touchSlop: 2);
 
   // Minimum span between opposite edges (~90 m) so the box can't invert.
   static const double _minSep = 0.0008;
@@ -71,45 +107,71 @@ class AreaSelectionOverlay extends StatelessWidget {
     final topCenter = toOffset(bounds.topCenter);
     final center = toOffset(bounds.center);
 
-    return Stack(
-      children: [
-        // Fill + border, drawn in screen space.
-        Positioned.fill(
-          child: IgnorePointer(
-            child: CustomPaint(
-              painter: _RectPainter(nw: nw, ne: ne, se: se, sw: sw),
+    // A fingertip needs a bigger target than a mouse pointer -- but never one
+    // so big that the corner handles cover the box they belong to. On a small
+    // box that would sit resize targets on top of the interior and make the box
+    // impossible to *move*, which is the opposite of the point.
+    final touch = switch (defaultTargetPlatform) {
+      TargetPlatform.android || TargetPlatform.iOS => true,
+      _ => false,
+    };
+    final minSide = math.min((se.dx - nw.dx).abs(), (se.dy - nw.dy).abs());
+    double fit(double desired) =>
+        math.max(22, math.min(desired, minSide * 0.4));
+
+    final cornerHit = fit(touch ? _cornerHitTouch : _cornerHitMouse);
+    final edgeLong = fit(touch ? _edgeHitLongTouch : _edgeHitLongMouse);
+    final edgeShort = fit(touch ? _edgeHitShortTouch : _edgeHitShortMouse);
+    final centreHit = fit(touch ? _centreHitTouch : _centreHitMouse);
+
+    return MediaQuery(
+      // Scoped to the handles below. The map's own recognisers are ancestors of
+      // this widget, so they keep the platform defaults and stay unaffected.
+      data: MediaQuery.of(context).copyWith(gestureSettings: _handleGestures),
+      child: Stack(
+        children: [
+          // Fill + border, drawn in screen space.
+          Positioned.fill(
+            child: IgnorePointer(
+              child: CustomPaint(
+                painter: _RectPainter(nw: nw, ne: ne, se: se, sw: sw),
+              ),
             ),
           ),
-        ),
 
-        // Drag anywhere in the box to move it. Sits below the handles so they
-        // win the hit test where they overlap.
-        if (!locked) _interior(nw, se, camera),
+          // Drag anywhere in the box to move it. Sits below the handles so they
+          // win the hit test where they overlap.
+          if (!locked && gesturesEnabled) _interior(nw, se, camera),
 
-        // Area badge straddling the top edge.
-        Positioned(
-          left: topCenter.dx,
-          top: topCenter.dy,
-          child: FractionalTranslation(
-            translation: const Offset(-0.5, -0.5),
-            child: IgnorePointer(child: _AreaBadge(areaKm2: bounds.areaKm2)),
+          // Area badge straddling the top edge.
+          Positioned(
+            left: topCenter.dx,
+            top: topCenter.dy,
+            child: FractionalTranslation(
+              translation: const Offset(-0.5, -0.5),
+              child: IgnorePointer(child: _AreaBadge(areaKm2: bounds.areaKm2)),
+            ),
           ),
-        ),
 
-        if (locked)
-          _centred(center, _centreDot, const IgnorePointer(child: _LockDot()))
-        else ...[
-          _edgeHandle(_Edge.n, toOffset(bounds.topCenter), camera),
-          _edgeHandle(_Edge.s, toOffset(bounds.bottomCenter), camera),
-          _edgeHandle(_Edge.w, toOffset(bounds.leftCenter), camera),
-          _edgeHandle(_Edge.e, toOffset(bounds.rightCenter), camera),
-          _cornerHandle(_Corner.nw, nw, camera),
-          _cornerHandle(_Corner.ne, ne, camera),
-          _cornerHandle(_Corner.sw, sw, camera),
-          _cornerHandle(_Corner.se, se, camera),
-          _moveHandle(center, camera),
+          if (locked)
+            _centred(center, _centreDot, const IgnorePointer(child: _LockDot()))
+          else if (gesturesEnabled) ...[
+            _edgeHandle(_Edge.n, toOffset(bounds.topCenter), camera, edgeLong,
+                edgeShort),
+            _edgeHandle(_Edge.s, toOffset(bounds.bottomCenter), camera,
+                edgeLong, edgeShort),
+            _edgeHandle(_Edge.w, toOffset(bounds.leftCenter), camera, edgeLong,
+                edgeShort),
+            _edgeHandle(_Edge.e, toOffset(bounds.rightCenter), camera, edgeLong,
+                edgeShort),
+            _cornerHandle(_Corner.nw, nw, camera, cornerHit),
+            _cornerHandle(_Corner.ne, ne, camera, cornerHit),
+            _cornerHandle(_Corner.sw, sw, camera, cornerHit),
+            _cornerHandle(_Corner.se, se, camera, cornerHit),
+            _moveHandle(center, camera, centreHit),
+          ],
         ],
-      ],
+      ),
     );
   }
 
@@ -137,6 +199,10 @@ class AreaSelectionOverlay extends StatelessWidget {
         cursor: SystemMouseCursors.move,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
+          // Track from pointer-down. The default, DragStartBehavior.start,
+          // throws away everything moved before the recogniser accepted,
+          // which reads as a dead zone at the start of every drag.
+          dragStartBehavior: DragStartBehavior.down,
           onPanStart: (_) => onDragStart(),
           onPanUpdate: (d) => _dragMove(d.delta, camera),
           onPanEnd: (_) => onDragEnd(),
@@ -146,7 +212,8 @@ class AreaSelectionOverlay extends StatelessWidget {
     );
   }
 
-  Widget _cornerHandle(_Corner corner, Offset pos, MapCamera camera) {
+  Widget _cornerHandle(
+      _Corner corner, Offset pos, MapCamera camera, double hit) {
     final cursor = switch (corner) {
       _Corner.nw || _Corner.se => SystemMouseCursors.resizeUpLeftDownRight,
       _Corner.ne || _Corner.sw => SystemMouseCursors.resizeUpRightDownLeft,
@@ -154,11 +221,15 @@ class AreaSelectionOverlay extends StatelessWidget {
 
     return _centred(
       pos,
-      _cornerHit,
+      hit,
       MouseRegion(
         cursor: cursor,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
+          // Track from pointer-down. The default, DragStartBehavior.start,
+          // throws away everything moved before the recogniser accepted,
+          // which reads as a dead zone at the start of every drag.
+          dragStartBehavior: DragStartBehavior.down,
           onPanStart: (_) => onDragStart(),
           onPanUpdate: (d) => _dragCorner(corner, d.delta, camera),
           onPanEnd: (_) => onDragEnd(),
@@ -169,10 +240,11 @@ class AreaSelectionOverlay extends StatelessWidget {
     );
   }
 
-  Widget _edgeHandle(_Edge edge, Offset pos, MapCamera camera) {
+  Widget _edgeHandle(_Edge edge, Offset pos, MapCamera camera, double hitLong,
+      double hitShort) {
     final horizontal = edge == _Edge.n || edge == _Edge.s;
-    final hitWidth = horizontal ? _edgeHitLong : _edgeHitShort;
-    final hitHeight = horizontal ? _edgeHitShort : _edgeHitLong;
+    final hitWidth = horizontal ? hitLong : hitShort;
+    final hitHeight = horizontal ? hitShort : hitLong;
 
     return Positioned(
       left: pos.dx - hitWidth / 2,
@@ -185,6 +257,10 @@ class AreaSelectionOverlay extends StatelessWidget {
             : SystemMouseCursors.resizeLeftRight,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
+          // Track from pointer-down. The default, DragStartBehavior.start,
+          // throws away everything moved before the recogniser accepted,
+          // which reads as a dead zone at the start of every drag.
+          dragStartBehavior: DragStartBehavior.down,
           onPanStart: (_) => onDragStart(),
           onPanUpdate: (d) => _dragEdge(edge, d.delta, camera),
           onPanEnd: (_) => onDragEnd(),
@@ -200,14 +276,18 @@ class AreaSelectionOverlay extends StatelessWidget {
     );
   }
 
-  Widget _moveHandle(Offset pos, MapCamera camera) {
+  Widget _moveHandle(Offset pos, MapCamera camera, double hit) {
     return _centred(
       pos,
-      _centreHit,
+      hit,
       MouseRegion(
         cursor: SystemMouseCursors.move,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
+          // Track from pointer-down. The default, DragStartBehavior.start,
+          // throws away everything moved before the recogniser accepted,
+          // which reads as a dead zone at the start of every drag.
+          dragStartBehavior: DragStartBehavior.down,
           onPanStart: (_) => onDragStart(),
           onPanUpdate: (d) => _dragMove(d.delta, camera),
           onPanEnd: (_) => onDragEnd(),
@@ -318,7 +398,8 @@ class AreaSelectionOverlay extends StatelessWidget {
 class _RectPainter extends CustomPainter {
   final Offset nw, ne, se, sw;
 
-  _RectPainter({required this.nw, required this.ne, required this.se, required this.sw});
+  _RectPainter(
+      {required this.nw, required this.ne, required this.se, required this.sw});
 
   @override
   void paint(Canvas canvas, Size size) {

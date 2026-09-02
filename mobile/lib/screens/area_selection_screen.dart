@@ -59,6 +59,12 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
   /// the map instead of moving the box.
   bool _boxLocked = false;
 
+  /// Pointers currently down anywhere on the map, and whether that adds up to
+  /// a pinch. Two fingers means the user wants to zoom, so the box's handles
+  /// leave the widget tree for the duration -- see [_onPointerCountChanged].
+  int _pointersDown = 0;
+  bool _pinching = false;
+
   @override
   void initState() {
     super.initState();
@@ -105,6 +111,23 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
     );
   }
 
+  /// Keeps [_pinching] in step with how many fingers are on the map.
+  ///
+  /// The box's handles now win the gesture arena against the map on touch (see
+  /// `_handleGestures` in selection_overlay.dart), which is what makes the box
+  /// draggable at all. The cost is that a two-finger pinch starting inside the
+  /// box would also be claimed by the box. Dropping the handles out of the tree
+  /// while a second finger is down disposes their recognisers and hands the
+  /// gesture back to the map, so pinch-to-zoom keeps working anywhere.
+  ///
+  /// Not applied mid-drag: an accidental second finger should not abandon a box
+  /// drag that is already under way.
+  void _onPointerCountChanged(int delta) {
+    _pointersDown = (_pointersDown + delta).clamp(0, 10);
+    final pinching = _pointersDown >= 2 && !_draggingHandle;
+    if (pinching != _pinching) setState(() => _pinching = pinching);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -122,45 +145,53 @@ class _AreaSelectionScreenState extends State<AreaSelectionScreen> {
   }
 
   Widget _buildMap() {
-    return SmoothMapGestures(
-      controller: _mapController,
-      minZoom: _minZoom,
-      maxZoom: _maxZoom,
-      enabled: !_draggingHandle,
-      child: FlutterMap(
-        mapController: _mapController,
-        options: MapOptions(
-          initialCenter: _initialCenter,
-          initialZoom: 12.5,
-          minZoom: _minZoom,
-          maxZoom: _maxZoom,
-          backgroundColor: const Color(0xFF1A1A1A),
-          // Freeze map gestures while a selection handle is being dragged.
-          interactionOptions: InteractionOptions(
-            flags: _draggingHandle ? InteractiveFlag.none : kSmoothInteractiveFlags,
+    return Listener(
+      onPointerDown: (_) => _onPointerCountChanged(1),
+      onPointerUp: (_) => _onPointerCountChanged(-1),
+      onPointerCancel: (_) => _onPointerCountChanged(-1),
+      child: SmoothMapGestures(
+        controller: _mapController,
+        minZoom: _minZoom,
+        maxZoom: _maxZoom,
+        enabled: !_draggingHandle,
+        child: FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(
+            initialCenter: _initialCenter,
+            initialZoom: 12.5,
+            minZoom: _minZoom,
+            maxZoom: _maxZoom,
+            backgroundColor: const Color(0xFF1A1A1A),
+            // Freeze map gestures while a selection handle is being dragged.
+            interactionOptions: InteractionOptions(
+              flags: _draggingHandle
+                  ? InteractiveFlag.none
+                  : kSmoothInteractiveFlags,
+            ),
           ),
-        ),
-        children: [
-          TileLayer(
-            urlTemplate: _satellite ? _imageryUrl : _streetUrl,
-            userAgentPackageName: 'com.ubiquitouseye.app',
-            maxNativeZoom: 18,
-          ),
-          if (_satellite)
+          children: [
             TileLayer(
-              urlTemplate: _labelsUrl,
+              urlTemplate: _satellite ? _imageryUrl : _streetUrl,
               userAgentPackageName: 'com.ubiquitouseye.app',
               maxNativeZoom: 18,
             ),
-          AreaSelectionOverlay(
-            bounds: _bounds,
-            locked: _boxLocked,
-            onChanged: (b) => setState(() => _bounds = b),
-            onDragStart: () => setState(() => _draggingHandle = true),
-            onDragEnd: () => setState(() => _draggingHandle = false),
-          ),
-          _buildAttribution(),
-        ],
+            if (_satellite)
+              TileLayer(
+                urlTemplate: _labelsUrl,
+                userAgentPackageName: 'com.ubiquitouseye.app',
+                maxNativeZoom: 18,
+              ),
+            AreaSelectionOverlay(
+              bounds: _bounds,
+              locked: _boxLocked,
+              gesturesEnabled: !_pinching,
+              onChanged: (b) => setState(() => _bounds = b),
+              onDragStart: () => setState(() => _draggingHandle = true),
+              onDragEnd: () => setState(() => _draggingHandle = false),
+            ),
+            _buildAttribution(),
+          ],
+        ),
       ),
     );
   }
