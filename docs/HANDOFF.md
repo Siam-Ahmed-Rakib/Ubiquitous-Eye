@@ -1,8 +1,8 @@
 # HANDOFF - read this first
 
 Written 2026-08-26 on the user's **Windows** machine, for a session on the user's
-**Ubuntu** machine. Updated 2026-09-02: the first deploy is done, so this is now a
-*re*deploy guide.
+**Ubuntu** machine. Updated 2026-09-02: `8dba210` is now deployed. Deploys are
+routine from here; this is a *re*deploy guide.
 
 ---
 
@@ -14,8 +14,9 @@ The backend is already live at
 https://ubiquitous-eye.redocean-c4117d93.malaysiawest.azurecontainerapps.io
 ```
 
-but it serves the code as of commit `5799969`. Commit `8dba210` ("cloud composite
-fix") is **not deployed**. Push it out:
+and as of 2026-09-02 it serves `8dba210` ("cloud composite fix"), pushed as image
+tag `7c3c540`. **The one thing still outstanding is warming the analyze cache** —
+see "Testing after deploy". To ship a later commit:
 
 ```bash
 cd ~/Ubiquitous-Eye          # or wherever you cloned it
@@ -29,9 +30,19 @@ App and `az containerapp update --image` leaves them alone. `.env` is only neede
 a from-scratch provision, or to run the stack locally. The "Secrets" section below is
 kept for those cases.
 
-Takes ~15-25 minutes, mostly the image build. It preflights the build context,
-builds locally, pushes to the existing registry, rolls a revision, and then checks
-that the *new* bundle is actually being served before declaring success.
+Takes ~15-25 minutes on a fast link. The 2026-09-02 run took **~20 minutes**, and
+~800s of that was a single 794 MB layer of the Flutter builder base image, which is
+now in the local Docker cache — expect subsequent runs to be much shorter. The script
+preflights the build context, builds locally, pushes to the existing registry, rolls
+a revision, and then checks that the *new* bundle is actually being served, and that
+the database secret survived, before declaring success.
+
+**Trust the live URL over the script's verdict if they ever disagree.** On the
+2026-09-02 run the script reported two failures against a completely healthy deploy:
+`curl | grep -q` under `set -o pipefail` turns a *successful* match into a failed
+pipeline (grep closes the pipe, curl exits 23), and the classify check only read the
+first 400 bytes of a 900 kB response whose `"cached"` key sits at byte ~865,000. Both
+are fixed, but the lesson generalises: verify by hand before believing a red result.
 
 **Use `azure-redeploy.sh`, never `azure-deploy.sh`.** The latter is create-only: it
 picks a random registry name when `ACR_NAME` is unset and calls

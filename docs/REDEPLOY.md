@@ -1,11 +1,10 @@
 # Redeploy runbook
 
-Getting commit `8dba210` ("cloud composite fix") onto the live Azure backend.
+How to ship the current commit to the live Azure backend.
 
-The live app currently serves the code as of `5799969`. Everything below has been
-prepared and the image has been built and tested end-to-end on the Windows machine;
-what has *not* been exercised is the Azure half (`az acr login` / `docker push` /
-`az containerapp update`), because Windows cannot authenticate to Azure.
+**This ran successfully on 2026-09-02**, putting `8dba210` ("cloud composite fix")
+live as image tag `7c3c540`. The whole path — build, `az acr login`, `docker push`,
+`az containerapp update`, revision swap — is now exercised, not just theorised.
 
 Work top to bottom. Each step says what you should see.
 
@@ -17,13 +16,11 @@ Work top to bottom. Each step says what you should see.
 git push origin master
 ```
 
-Should push two commits, `ae5c825` and `f79cbfd`. Confirm:
+Confirm what went up, and note the short SHA — it becomes the image tag, so it is
+also what you roll back to next time:
 
 ```bash
 git log --oneline -3
-# f79cbfd Harden azure-redeploy against the things that actually broke the first deploy
-# ae5c825 Make 8dba210 deployable: track the files its Dockerfile needs, add a redeploy path
-# 8dba210 cloud composite fix
 ```
 
 Now switch to Ubuntu.
@@ -63,7 +60,7 @@ rm -rf mobile/web mobile/pubspec.lock
 
 ```bash
 git pull
-git log --oneline -1          # expect f79cbfd
+git log --oneline -1          # should match what you pushed in Step 0
 ls -l mobile/pubspec.lock mobile/web/index.html
 ```
 
@@ -219,8 +216,9 @@ Re-run the same three afterwards to confirm they now return in seconds.
 | Build dies during pip with a network error | Just re-run the script. The Dockerfile mounts a BuildKit pip cache, so it resumes from the wheels already fetched rather than starting over. |
 | `denied: requested access to the resource is denied` on push | `az acr login --name ubiquitouseye29146` then re-run. |
 | Revision never becomes healthy | `az containerapp revision list -n ubiquitous-eye -g ubiquitous-eye-rg -o table`, then `az containerapp logs show -n ubiquitous-eye -g ubiquitous-eye-rg --tail 60` |
-| `new marker string absent` warning | The old bundle is still being served. Check that the revision actually swapped — see the revision list above. |
+| `the new bundle is not being served` | The push succeeded, so this is a revision problem, not a build one. `az containerapp revision list -n ubiquitous-eye -g ubiquitous-eye-rg -o table`, then `--type system` logs for image-pull errors. |
 | `classify probe did not succeed` | Secrets may not have carried over. Check the logs; a Sentinel Hub `403 Invalid or expired account` is an account problem, not a code fault. |
+| Script stops silently right after `verifying the app still has its secrets`, with no `DONE` block | Fixed on 2026-09-02, but if you ever see it again: it is `set -euo pipefail` killing the script because something closed a pipe on `curl`. It says nothing about the deploy, which by that point has already succeeded. Verify by hand with the two checks in Step 5. |
 
 ### Rollback
 

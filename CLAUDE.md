@@ -59,3 +59,8 @@ mangles `/app` into a Windows path and the exec fails with "Cwd must be absolute
 - **Bumping `ANALYZE_CACHE_KIND` silently orphans every cached analyze.** Rows are never
   deleted (standing instruction), so the table keeps growing and every demo area goes
   cold at once. Re-warm the areas in `DEMO.md` after any bump.
+- **`curl ... | grep -q` under `set -o pipefail` reports success as failure.** `grep -q`
+  exits on its first match and closes the pipe; `curl` then dies with exit 23 and
+  pipefail returns that for the whole pipeline. `curl ... | head -c` is the same bug
+  plus `set -e` killing the script. Both shipped in `azure-redeploy.sh` and made a
+  healthy deploy look like two failures. Write curl output to a file, then grep the file.

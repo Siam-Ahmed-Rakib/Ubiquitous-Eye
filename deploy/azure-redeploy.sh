@@ -110,20 +110,46 @@ az containerapp update \
 FQDN=$(az containerapp show -n "$APP" -g "$RG" --query "properties.configuration.ingress.fqdn" -o tsv)
 
 say "waiting for the new revision to serve"
-for i in $(seq 1 40); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$FQDN/api/health" || true)
-  [ "$code" = "200" ] && break
+# Three traps live in this block. All three fired on the first real redeploy and
+# between them reported a completely healthy deploy as two failures:
+#
+#  1. A 200 from /api/health does NOT prove the swap happened. The OLD revision
+#     answers it just as happily, and `az containerapp update` returns when the
+#     update is *accepted*, not when the new revision carries traffic. So the
+#     marker check has to be the thing that gets retried, not the health check.
+#  2. `curl ... | grep -q` looks harmless and is not. grep -q exits on its first
+#     match and closes the pipe, curl dies with exit 23 ("failed writing body"),
+#     and `set -o pipefail` reports the pipeline as failed -- so a SUCCESSFUL
+#     match gets reported as a failure. `curl ... | head -c` is the same bug and
+#     worse: it also trips `set -e` and kills the script mid-verification.
+#     Nothing below pipes out of curl; every response goes to a file first.
+#  3. The classify response is ~900 kB and its `"cached"` key sits at byte
+#     ~865,000. Inspecting the first 400 bytes could never have matched it.
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+live=0
+waited=0
+for i in $(seq 1 30); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$FQDN/api/health" || true)
+  if [ "$code" = "200" ] \
+     && curl -s --max-time 90 -o "$TMP/main.dart.js" "https://$FQDN/main.dart.js" \
+     && grep -q "clear observations" "$TMP/main.dart.js"; then
+    live=1
+    break
+  fi
+  waited=$((waited + 10))
   sleep 10
 done
 
 say "verifying the deployed bundle is the new build"
-# Cheapest honest check that the UI actually changed: a string that exists only
-# in the new client. A 200 from /api/health proves a container is up, not that
-# it is *this* container.
-if curl -s --max-time 60 "https://$FQDN/main.dart.js" | grep -q "clear observations"; then
-  echo "  new client confirmed live"
+if [ "$live" = 1 ]; then
+  echo "  new client confirmed live (${waited}s after the update)"
 else
-  echo "  WARNING: new marker string absent -- the old bundle may still be served"
+  echo "  WARNING: the new bundle is not being served."
+  echo "  The push succeeded, so this is a revision problem, not a build problem:"
+  echo "      az containerapp revision list -n $APP -g $RG -o table"
+  echo "      az containerapp logs show -n $APP -g $RG --type system --tail 40"
 fi
 
 say "verifying the app still has its secrets"
@@ -132,19 +158,24 @@ say "verifying the app still has its secrets"
 # "did", and a lost DATABASE_URL would not show up in /api/health. This area is
 # in the classify cache, whose key did NOT change in 8dba210, so a `cached:true`
 # answer proves the database secret survived the revision.
-probe=$(curl -s --max-time 120 -X POST "https://$FQDN/api/sentinel/classify" \
-  -H "Content-Type: application/json" \
-  -d '{"polygon":[[90.5805528458285,23.8364742130499],[90.6298069680125,23.8364742130499],[90.6298069680125,23.881519258095],[90.5805528458285,23.881519258095]],"year":2026,"month":2}' \
-  | head -c 400)
-case "$probe" in
-  *'"cached":true'*|*'"cached": true'*)
-    echo "  database reachable, cached classify served" ;;
-  *'"status":"success"'*)
-    echo "  classify succeeded but was NOT cached -- check the DB, it should have hit" ;;
-  *)
-    echo "  WARNING: classify probe did not succeed. First 400 bytes:"
-    echo "    $probe" ;;
-esac
+if curl -s --max-time 180 -o "$TMP/classify.json" \
+     -X POST "https://$FQDN/api/sentinel/classify" \
+     -H "Content-Type: application/json" \
+     -d '{"polygon":[[90.5805528458285,23.8364742130499],[90.6298069680125,23.8364742130499],[90.6298069680125,23.881519258095],[90.5805528458285,23.881519258095]],"year":2026,"month":2}'
+then
+  if grep -q '"cached": *true' "$TMP/classify.json"; then
+    echo "  database reachable, cached classify served"
+  elif grep -q '"status": *"success"' "$TMP/classify.json"; then
+    echo "  classify succeeded but was NOT cached -- check the DB, it should have hit"
+  else
+    echo "  WARNING: classify probe did not succeed. First 200 bytes:"
+    echo "    $(head -c 200 "$TMP/classify.json")"
+  fi
+else
+  echo "  WARNING: classify request failed outright -- the app may still be starting."
+  echo "  Re-run by hand before assuming the secrets are gone:"
+  echo "      curl -s -o /tmp/c.json https://$FQDN/api/health && cat /tmp/c.json"
+fi
 
 say "DONE"
 echo "  LIVE URL:  https://$FQDN"
