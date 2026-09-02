@@ -12,6 +12,13 @@
 # Needs Docker (the image is built locally -- `az acr build` is rejected on this
 # subscription with TasksOperationsNotAllowed) and a working `az account show`,
 # which means Ubuntu: the BUET tenant's Conditional Access policy blocks Windows.
+#
+# It does NOT need .env, and does NOT need Flutter on the host. The three secrets
+# already live on the Container App and are left untouched; Flutter runs inside
+# the image's first build stage. Nothing here creates a resource group, registry
+# or environment either, so none of the Azure for Students region policies that
+# fought the first deploy (southeastasia and centralindia both rejected for
+# Container Apps) can come back.
 set -euo pipefail
 
 RG=ubiquitous-eye-rg
@@ -61,10 +68,27 @@ MSG
 fi
 
 command -v docker >/dev/null || { echo "ERROR: docker not found; this script builds locally"; exit 1; }
-docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon is not running"; exit 1; }
+if ! docker info >/dev/null 2>&1; then
+  cat <<'MSG'
+  ERROR: cannot talk to the Docker daemon.
+
+  If it is a permission problem rather than a stopped daemon, this is the fix
+  that was needed on this machine the first time round -- and `newgrp` only
+  affects the shell you run it in, so it has to be re-run or the session
+  re-opened:
+
+      sudo usermod -aG docker $USER
+      newgrp docker
+
+MSG
+  exit 1
+fi
 
 say "checking login"
 az account show --query "{sub:name, state:state, user:user.name}" -o table
+# Cheap and idempotent. `az containerapp` lives in an extension; if it were
+# missing the update below would fail with an unhelpful "command not found".
+az extension add --name containerapp --upgrade --only-show-errors >/dev/null 2>&1 || true
 
 say "building $REPO:$TAG"
 # BuildKit is required: the Dockerfile declares `# syntax=docker/dockerfile:1.7`
@@ -101,6 +125,26 @@ if curl -s --max-time 60 "https://$FQDN/main.dart.js" | grep -q "clear observati
 else
   echo "  WARNING: new marker string absent -- the old bundle may still be served"
 fi
+
+say "verifying the app still has its secrets"
+# `az containerapp update --image` patches the container template and leaves
+# secrets and env-vars alone, so this should always pass -- but "should" is not
+# "did", and a lost DATABASE_URL would not show up in /api/health. This area is
+# in the classify cache, whose key did NOT change in 8dba210, so a `cached:true`
+# answer proves the database secret survived the revision.
+probe=$(curl -s --max-time 120 -X POST "https://$FQDN/api/sentinel/classify" \
+  -H "Content-Type: application/json" \
+  -d '{"polygon":[[90.5805528458285,23.8364742130499],[90.6298069680125,23.8364742130499],[90.6298069680125,23.881519258095],[90.5805528458285,23.881519258095]],"year":2026,"month":2}' \
+  | head -c 400)
+case "$probe" in
+  *'"cached":true'*|*'"cached": true'*)
+    echo "  database reachable, cached classify served" ;;
+  *'"status":"success"'*)
+    echo "  classify succeeded but was NOT cached -- check the DB, it should have hit" ;;
+  *)
+    echo "  WARNING: classify probe did not succeed. First 400 bytes:"
+    echo "    $probe" ;;
+esac
 
 say "DONE"
 echo "  LIVE URL:  https://$FQDN"

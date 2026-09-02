@@ -21,9 +21,13 @@ fix") is **not deployed**. Push it out:
 cd ~/Ubiquitous-Eye          # or wherever you cloned it
 git pull
 az account show              # must succeed; if not see "Azure login" below
-cat .env                     # must have 3 lines; see "Secrets" below
 bash deploy/azure-redeploy.sh
 ```
+
+**A redeploy does not need `.env`.** The three secrets already live on the Container
+App and `az containerapp update --image` leaves them alone. `.env` is only needed for
+a from-scratch provision, or to run the stack locally. The "Secrets" section below is
+kept for those cases.
 
 Takes ~15-25 minutes, mostly the image build. It preflights the build context,
 builds locally, pushes to the existing registry, rolls a revision, and then checks
