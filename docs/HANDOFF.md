@@ -15,8 +15,13 @@ https://ubiquitous-eye.redocean-c4117d93.malaysiawest.azurecontainerapps.io
 ```
 
 and as of 2026-09-02 it serves `8dba210` ("cloud composite fix"), pushed as image
-tag `7c3c540`. **The one thing still outstanding is warming the analyze cache** —
-see "Testing after deploy". To ship a later commit:
+tag `7c3c540`.
+
+**Two things are outstanding.** Warming the analyze cache — see "Testing
+after deploy" below. And `49da788`, which makes the selection box draggable on
+touch devices, is **in the APK but not yet on the web**: the Flutter bundle is
+built into the container image, so every client-side fix needs a redeploy before
+it reaches mobile web. To ship it, and any later commit:
 
 ```bash
 cd ~/Ubiquitous-Eye          # or wherever you cloned it
