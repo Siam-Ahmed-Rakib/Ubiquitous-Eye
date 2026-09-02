@@ -6,7 +6,10 @@
 build/
 .flutter-plugins
 .flutter-plugins-dependencies
-pubspec.lock
+
+# pubspec.lock IS tracked. This is an application, not a library, and
+# server/Dockerfile COPYs it so the image resolves the same dependency versions
+# the digest-pinned base images were chosen to guarantee.
 
 # IDE
 .idea/
@@ -18,10 +21,15 @@ pubspec.lock
 .DS_Store
 Thumbs.db
 
-# Generated platform folders (run `flutter create .` locally)
+# Generated platform folders (run `flutter create .` locally).
+#
+# web/ is deliberately NOT listed: server/Dockerfile stopped running
+# `flutter create . --platforms web`, so the web/ directory has to arrive in a
+# clone or the image build fails. It also carries the app title, icons and
+# manifest -- while it was ignored, production served a tab reading
+# "ubiquitous_eye".
 android/
 ios/
-web/
 linux/
 macos/
 windows/

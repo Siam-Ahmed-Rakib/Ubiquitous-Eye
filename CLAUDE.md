@@ -32,7 +32,9 @@ the same image works on localhost, a tunnel, or a hosted URL with no rebuild.
 ```sh
 docker compose --project-directory . up -d --build   # local stack -> :5001
 docker compose --project-directory . down
-bash deploy/azure-deploy.sh                          # deploy to Azure Container Apps
+bash deploy/azure-redeploy.sh                        # ship HEAD to Azure (build+push+revision)
+# deploy/azure-deploy.sh is FIRST-PROVISION ONLY -- re-running it mints a second
+# random-named registry and then `az containerapp create`s over the existing app.
 ```
 
 Run `docker exec -w /app ...` through **PowerShell**, not Bash — the Bash tool
@@ -50,3 +52,10 @@ mangles `/app` into a Windows path and the exec fails with "Cwd must be absolute
   Release APKs use `main/`. Already fixed; do not let a regenerated `android/` drop it.
 - **`docker-compose.yml` must not mount `./Frontend/dist` over `/app/frontend_dist`.**
   It shadows the UI the image builds with an empty host directory.
+- **`mobile/.gitignore` must keep tracking `pubspec.lock` and `web/`.** `server/Dockerfile`
+  COPYs the lockfile and no longer runs `flutter create . --platforms web`, so if either
+  is re-ignored the image builds fine for whoever has them locally and fails for everyone
+  else. `deploy/azure-redeploy.sh` preflights for both.
+- **Bumping `ANALYZE_CACHE_KIND` silently orphans every cached analyze.** Rows are never
+  deleted (standing instruction), so the table keeps growing and every demo area goes
+  cold at once. Re-warm the areas in `DEMO.md` after any bump.

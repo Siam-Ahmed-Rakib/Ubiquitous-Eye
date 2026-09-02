@@ -1,22 +1,19 @@
-# Demo cheat sheet — 2026-08-26
+# Demo cheat sheet — updated 2026-09-02
 
 ## Link
 
-    https://advanced-ricky-granted-foam.trycloudflare.com
+    https://ubiquitous-eye.redocean-c4117d93.malaysiawest.azurecontainerapps.io
 
-Works on any phone or laptop. **Keep the cloudflared terminal open** — closing it
-kills the link. If it dies, rerun and the URL will be different:
+Permanent. Nothing to keep open, no laptop involved — this is Azure Container Apps
+with min-replicas 1, so it is always warm. Works on any phone or laptop, and the
+same URL serves both the web app and the API.
 
-    & "C:\Users\USER\cloudflared.exe" tunnel --url http://localhost:5001
-
-Docker must also be running: `docker compose --project-directory . up -d`
+Docker on the laptop is **not** required any more. The old cloudflared tunnel is
+retired; if you find a `trycloudflare.com` link anywhere, it is dead.
 
 ## Draw these areas — they return in ~2 seconds
 
-Cached results. Anything else runs the live pipeline: **~160 s**, because a whole
-month of Sentinel-2 + Landsat scenes is fetched one at a time.
-
-### Land classification (pick a month, single date)
+### Land classification (pick a month, single date) — still cached
 
 | month | longitude | latitude | size |
 |---|---|---|---|
@@ -27,7 +24,11 @@ month of Sentinel-2 + Landsat scenes is fetched one at a time.
 | 2026-06 | 90.3158 – 90.3651 | 23.7510 – 23.7960 | 5.0 x 5.0 km |
 | 2026-05 | 90.3800 – 90.4000 | 23.7800 – 23.8000 | 2.0 x 2.2 km |
 
-### Change detection (pick two dates)
+### Change detection (pick two dates) — ⚠ cache reset on 2026-09-02
+
+Commit `8dba210` moved the analyze cache from `analyze_v5` to `analyze_v7`, so these
+are **cold until you run each one once**. Run all three after deploying and before
+demoing; each first run takes minutes.
 
 | from → to | longitude | latitude | size |
 |---|---|---|---|
@@ -36,21 +37,29 @@ month of Sentinel-2 + Landsat scenes is fetched one at a time.
 | 2024-06 → 2026-08 | 90.4063 – 90.4244 | 23.7581 – 23.7786 | 1.8 x 2.3 km |
 
 The 8 x 9 km 2020→2025 one is the strongest change-detection story — largest area,
-five-year span.
+five-year span. It is also the slowest to warm, so start it first.
 
 ## If something goes wrong mid-demo
 
-- **Blank page / spinner forever** — tunnel dropped. Check the cloudflared terminal.
-- **Request hangs ~2-3 min** — the area drawn was not cached; it is running the real
-  pipeline, not broken. Let it finish or draw one from the tables above.
-- **500 on classify/analyze** — check `docker logs capstone-backend --tail 40`. A
-  Sentinel Hub `403 Invalid or expired account` means the SH subscription lapsed
-  again, not a code fault.
+- **Request hangs for minutes** — the area drawn was not cached; it is running the
+  real pipeline, not broken. Let it finish, or draw one from the tables above.
+- **500 on classify/analyze** — a Sentinel Hub `403 Invalid or expired account` means
+  the SH subscription lapsed again, not a code fault. Check with
+  `az containerapp logs show -n ubiquitous-eye -g ubiquitous-eye-rg --tail 40`.
+- **Everything is 502/503** — a revision failed to start. Check
+  `az containerapp revision list -n ubiquitous-eye -g ubiquitous-eye-rg -o table`
+  and roll back to the previous image tag.
 
 ## Honest framing for questions
 
-- The link is a tunnel to this laptop, not cloud hosting. Permanent hosting on Azure
-  Container Apps is scripted and ready (`deploy/azure-deploy.sh`) but blocked by a
-  BUET tenant device policy on the Windows machine; it deploys from the Ubuntu box.
-- Cached areas are instant; uncached takes ~160 s, 98% of which is downloading a
-  month of satellite scenes serially. The classification itself is 0.3 s.
+- **Hosting is real**, not a tunnel to a laptop: Azure Container Apps, 0.5 vCPU /
+  1 GiB, always-on, one container serving both the Flutter web client and the API
+  from the same origin.
+- Cached areas are instant. An uncached one is dominated by downloading a month of
+  Sentinel-2 and Landsat scenes serially — ~98% of the wall time. The classification
+  itself, a four-model ensemble over ~30,000 cells, takes **0.3 s**.
+- Since `8dba210` a change is only reported where **both** dates had at least two
+  clear satellite observations of that pixel. Anything cloudier is reported as
+  uncertain rather than being forced into a land-cover transition. That is why the
+  UI shows a reliable-pixel count next to the totals — it is a deliberate statement
+  about what the data can and cannot support.

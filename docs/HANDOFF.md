@@ -1,23 +1,39 @@
 # HANDOFF - read this first
 
-Written 2026-08-26 evening on the user's **Windows** machine, for a fresh Claude
-session on the user's **Ubuntu** machine.
+Written 2026-08-26 on the user's **Windows** machine, for a session on the user's
+**Ubuntu** machine. Updated 2026-09-02: the first deploy is done, so this is now a
+*re*deploy guide.
 
 ---
 
 ## TL;DR - what to do
 
-Deploy the backend to Azure Container Apps. Everything is prepared; it is one command.
+The backend is already live at
+
+```
+https://ubiquitous-eye.redocean-c4117d93.malaysiawest.azurecontainerapps.io
+```
+
+but it serves the code as of commit `5799969`. Commit `8dba210` ("cloud composite
+fix") is **not deployed**. Push it out:
 
 ```bash
 cd ~/Ubiquitous-Eye          # or wherever you cloned it
+git pull
 az account show              # must succeed; if not see "Azure login" below
 cat .env                     # must have 3 lines; see "Secrets" below
-bash deploy/azure-deploy.sh
+bash deploy/azure-redeploy.sh
 ```
 
-Takes ~15-20 minutes, mostly the image build. It prints the live URL at the end, plus
-the exact `flutter build apk` command with that URL already substituted.
+Takes ~15-25 minutes, mostly the image build. It preflights the build context,
+builds locally, pushes to the existing registry, rolls a revision, and then checks
+that the *new* bundle is actually being served before declaring success.
+
+**Use `azure-redeploy.sh`, never `azure-deploy.sh`.** The latter is create-only: it
+picks a random registry name when `ACR_NAME` is unset and calls
+`az containerapp create`, so re-running it builds a second, empty registry and then
+points the app at an image that is not in it. It is kept only as the record of how
+the app was first provisioned.
 
 Then work through **Testing after deploy** near the bottom.
 
@@ -60,10 +76,41 @@ bundle to `/app/frontend_dist`. `api_server.py` serves the UI from `/` and the A
 
 ### Not done
 
-- **Azure deploy** - this is your job. The script is written and committed.
-- **APK build** - Gradle crashed on Windows with `Gradle build daemon disappeared
-  unexpectedly`, almost certainly memory contention with Docker running. Untested on
-  Ubuntu. Do it after the deploy, against the live URL.
+- **Redeploying `8dba210`** - this is your job. `bash deploy/azure-redeploy.sh`.
+- **APK rebuild against the new backend.** An APK was built on Windows on 2026-08-26
+  and works, but it predates `8dba210` and its `stats` parsing. The client tolerates
+  the new fields being absent, not the reverse, so it will keep working - it just
+  will not show the reliability figures.
+
+---
+
+## What commit 8dba210 changes, and what it costs
+
+`8dba210` ("cloud composite fix", hamim-87) reworks how composites are built:
+whole-month windows that adapt up to `MAX_ADAPTIVE_WINDOW_DAYS = 60` when cloud
+forces it, and a reliability gate requiring `MIN_CLEAR_OBSERVATIONS = 2` clear looks
+per pixel on both dates before a change is reported. Pixels that fail the gate are
+counted as uncertain rather than being forced into a land-cover transition. The
+response gains `eligiblePixels`, `uncertainPixels`, `minimumClearObservations` and
+exact `oldWindowStart`/`oldWindowEnd`/`newWindowStart`/`newWindowEnd`.
+
+Two consequences that will surprise you if you meet them during a demo:
+
+- **Every cached analyze goes cold.** `ANALYZE_CACHE_KIND` moved `analyze_v5` ->
+  `analyze_v7`, so none of the analyze areas listed below are instant any more.
+  **Classify is unaffected** - its cache key is the literal string `"classify"` and
+  did not change, so classify areas stay warm.
+- **A cold analyze is slower than it used to be**, on top of that. The old code
+  composited half a month; this composites a whole one and may widen to 60 days.
+  Since ~98% of a cold request is serial Sentinel Hub round-trips, expect roughly 2x
+  or worse. That is an estimate from the window size, not a measurement.
+
+If analyze is being demoed, re-run the demo areas once after deploying to re-warm
+the cache rather than discovering this in front of an audience.
+
+It also changed the build in two ways worth knowing: `xgboost` -> `xgboost-cpu`
+(same Python module, drops the large NVIDIA NCCL runtime) and a BuildKit pip cache
+mount, so `# syntax=docker/dockerfile:1.7` means **BuildKit is now mandatory**.
 
 ---
 
@@ -113,22 +160,39 @@ that `DATABASE_URL` ends in `/postgres`.
 
 ---
 
-## What the deploy script does
+## What the scripts do
 
-`deploy/azure-deploy.sh`:
+### `deploy/azure-redeploy.sh` - use this one
 
-1. Registers `Microsoft.App`, `Microsoft.ContainerRegistry`, `Microsoft.OperationalInsights`.
-2. Creates resource group `ubiquitous-eye-rg` in **southeastasia**.
-3. Creates an Azure Container Registry, Basic SKU, admin enabled.
-4. Runs **`az acr build`** - uploads only the build context (~30 MB after
-   `.dockerignore`) and builds the image **inside Azure**. This is why Ubuntu needs no
-   Docker at all.
-5. Creates a Container Apps environment with `--logs-destination none`, to avoid a
-   Log Analytics bill.
-6. Creates the Container App: **0.5 vCPU / 1 GiB, min-replicas 1, max 3**, external
-   ingress, target port 5000. Secrets are injected as Container Apps secrets, never
-   baked into the image.
-7. Prints the FQDN.
+1. **Preflights the build context** for `mobile/pubspec.lock` and `mobile/web/index.html`
+   and refuses to start without them. See the trap below.
+2. Builds the image **locally** with BuildKit and tags it with the short commit SHA
+   (`-dirty` appended if the tree is not clean).
+3. `az acr login`, tags for `ubiquitouseye29146.azurecr.io`, pushes.
+4. `az containerapp update --image ...` to roll a new revision.
+5. Polls `/api/health`, then greps the served `main.dart.js` for a string that only
+   exists in the new client, so "deployed" means the new bundle is really being
+   served rather than just "a container is up".
+6. Prints the live URL, the exact rollback command, and the APK build command.
+
+**Why tag by SHA and not `:latest`** - Container Apps keys a new revision off the
+image *reference*. Re-pushing `:latest` leaves the reference unchanged, so the app
+can keep serving the old layers and the deploy silently does nothing.
+
+### `deploy/azure-deploy.sh` - first provision only, do not re-run
+
+Kept as the record of how the app was created: resource group `ubiquitous-eye-rg` in
+**southeastasia**, ACR Basic with admin enabled, a Container Apps environment with
+`--logs-destination none` to avoid a Log Analytics bill, and the app itself at
+**0.5 vCPU / 1 GiB, min-replicas 1, max 3**, external ingress, target port 5000,
+with the three secrets injected as Container Apps secrets rather than baked into the
+image.
+
+Its header still claims it uses `az acr build` and therefore needs no Docker. **That
+is not true on this subscription** - `az acr build` is rejected with
+`TasksOperationsNotAllowed`, which is why the image is built locally and pushed.
+Re-running it would also mint a *new* random registry name and then
+`az containerapp create` over an app that already exists.
 
 **Why 0.5 vCPU and not more** - measured, please do not re-litigate: a cold classify is
 98% serial Sentinel Hub round-trips. The 4-model ensemble over 31,659 cells takes
@@ -182,7 +246,9 @@ Classify:
 - `2026-01` lon 90.3158-90.3651, lat 23.7510-23.7960
 - `2026-01` lon 90.3562-90.4054, lat 23.8139-23.8589
 
-Analyze (`analyze_v5`):
+Analyze - **all cold after `8dba210`**, because the cache kind moved `analyze_v5` ->
+`analyze_v7`. These are the areas worth re-warming first; the old rows are still in
+the table under the v5 key and are simply never read:
 
 - `2020-10 -> 2025-10` lon 90.4652-90.5434, lat 23.9017-23.9822  (8 x 9 km, best demo)
 - `2024-06 -> 2026-08` lon 90.4063-90.4244, lat 23.7581-23.7786
@@ -249,6 +315,15 @@ org.gradle.jvmargs=-Xmx2048m
   a stopgap. That is a tunnel limit, not an app bug, and hosting removes it.
 - **On Windows, run `docker exec -w /app ...` through PowerShell, not Bash** - the Bash
   tool mangles `/app` into a Windows path. Irrelevant on Ubuntu.
+- **`mobile/.gitignore` used to hide files the image build needs.** `8dba210` added
+  `COPY mobile/pubspec.lock` and deleted `RUN flutter create . --platforms web`, while
+  `pubspec.lock` and `web/` were both still ignored - so the build worked on the author's
+  machine and could not work from a clone. Fixed on 2026-09-02 by tracking both. If a
+  regenerated `mobile/` ever re-adds those two lines to `.gitignore`, the Flutter stage
+  starts failing several minutes in with an error that does not name the cause;
+  `azure-redeploy.sh` now preflights for exactly this. `android/` is still ignored, so
+  the release-manifest `INTERNET` permission and the Gradle heap fix continue to live
+  only on the Windows box.
 
 ---
 
