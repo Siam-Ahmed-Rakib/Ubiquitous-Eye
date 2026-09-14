@@ -78,8 +78,13 @@ def ensemble_predict(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- Load models and predict ---
     model_names = ["xgboost", "catboost", "lightgbm", "cart"]
-    predictions = np.array([
-        joblib.load(os.path.join(model_dir, f"{name}.joblib")).predict(X_scaled)
+    # Some estimators return ``(n_samples, 1)`` while others return
+    # ``(n_samples,)``. Flatten each one before stacking so mixed model APIs do
+    # not make NumPy create an inhomogeneous object array.
+    predictions = np.vstack([
+        np.asarray(
+            joblib.load(os.path.join(model_dir, f"{name}.joblib")).predict(X_scaled)
+        ).reshape(-1)
         for name in model_names
     ])  # shape: (4, n_samples)
 

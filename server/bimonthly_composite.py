@@ -277,15 +277,41 @@ def adaptive_windows(
     return windows
 
 
-def search_dates(collection, bbox, start, end, catalog_cfg):
+def search_dates(collection, bbox, start, end, catalog_cfg, max_cloud_coverage: float | None = None):
+    """Return unique acquisition dates, optionally filtered by catalogue cloud cover.
+
+    ``eo:cloud_cover`` is the Sentinel Hub catalogue scene percentage. It is
+    evaluated for the scene footprint intersecting ``bbox``; it is not a
+    per-pixel cloud calculation for an arbitrary polygon.
+    """
     catalog = SentinelHubCatalog(config=catalog_cfg)
     results = list(catalog.search(
         collection, bbox=bbox,
         time=(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
         fields={"include": ["id", "properties.datetime", "properties.eo:cloud_cover"], "exclude": []},
     ))
-    dates = sorted(set(item["properties"]["datetime"][:10] for item in results))
-    logger.info("  %s: %d scenes -> %d unique dates", collection.api_id, len(results), len(dates))
+    accepted = []
+    rejected = 0
+    for item in results:
+        properties = item.get("properties", {})
+        cloud_cover = properties.get("eo:cloud_cover")
+        if max_cloud_coverage is not None:
+            try:
+                if cloud_cover is None or float(cloud_cover) > max_cloud_coverage:
+                    rejected += 1
+                    continue
+            except (TypeError, ValueError):
+                rejected += 1
+                continue
+        accepted.append(properties["datetime"][:10])
+    dates = sorted(set(accepted))
+    if max_cloud_coverage is None:
+        logger.info("  %s: %d scenes -> %d unique dates", collection.api_id, len(results), len(dates))
+    else:
+        logger.info(
+            "  %s: %d scenes -> %d unique dates at cloud <= %.1f%% (%d scenes rejected)",
+            collection.api_id, len(results), len(dates), max_cloud_coverage, rejected,
+        )
     return dates
 
 
