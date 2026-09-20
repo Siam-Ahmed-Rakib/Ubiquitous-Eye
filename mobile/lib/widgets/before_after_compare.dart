@@ -1,6 +1,5 @@
-import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/analysis_result.dart';
 import '../models/land_use_result.dart';
@@ -40,10 +39,39 @@ const double _differenceMaxHeight = 560;
 /// any one moves all of them. At any zoom the three show the same ground, which
 /// is what makes them comparable by eye rather than by hunting for the matching
 /// spot.
+/// Which change a service asks about. One service, one question, one layer.
+enum ChangeKind {
+  deforestation('Deforestation', 'tree cover that has gone'),
+  urbanization('Urbanization', 'ground that has been built on'),
+  waterLoss('Surface water loss', 'water that has gone');
+
+  const ChangeKind(this.label, this.blurb);
+
+  final String label;
+  final String blurb;
+
+  /// Maps an `AnalyticsService.id` onto the change it detects.
+  ///
+  /// Null for anything that is not a two-date change service, which is how the
+  /// generic "New Image" flow keeps showing every layer: with no service chosen
+  /// there is no single question being asked.
+  static ChangeKind? forServiceId(String? id) => switch (id) {
+        'deforestation' => ChangeKind.deforestation,
+        'urbanization' => ChangeKind.urbanization,
+        'surface_water_loss' => ChangeKind.waterLoss,
+        _ => null,
+      };
+}
+
 class BeforeAfterCompare extends StatefulWidget {
   final AnalysisResult result;
 
-  const BeforeAfterCompare({super.key, required this.result});
+  /// The change this run was asked for. When set, the difference picture shows
+  /// only that layer — picking "Deforestation" and being handed water loss as
+  /// well is answering a question nobody asked.
+  final ChangeKind? only;
+
+  const BeforeAfterCompare({super.key, required this.result, this.only});
 
   @override
   State<BeforeAfterCompare> createState() => _BeforeAfterCompareState();
@@ -52,6 +80,17 @@ class BeforeAfterCompare extends StatefulWidget {
 class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
   final TransformationController _transform = TransformationController();
 
+  /// Pictures start locked, and scrolling the results page is why.
+  ///
+  /// An [InteractiveViewer] claims the scroll wheel as zoom and a drag as pan,
+  /// so three of them stacked down a scrolling page make the page almost
+  /// unusable: a flick meant to scroll past a picture instead zooms it and
+  /// drags the ground sideways. Locked, the pictures ignore both and the
+  /// gesture goes to the page. Zoom is still there, one tap away, and comparing
+  /// the dates closely is a deliberate act rather than something you trigger by
+  /// trying to scroll.
+  bool _zoomUnlocked = false;
+
   /// Land-cover colouring on. Starts on when the backend sent class maps: the
   /// classification is the thing this screen has to say, and the raw scene is
   /// one switch away for anyone who wants to check it against the ground.
@@ -59,6 +98,19 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
 
   bool _showDeforestation = true;
   bool _showWaterLoss = true;
+  bool _showUrbanization = true;
+
+  /// Whether [kind] should be drawn: the chosen service's layer only, or all of
+  /// them when no single change was asked for.
+  bool _visible(ChangeKind kind) {
+    final only = widget.only;
+    if (only != null) return only == kind;
+    return switch (kind) {
+      ChangeKind.deforestation => _showDeforestation,
+      ChangeKind.waterLoss => _showWaterLoss,
+      ChangeKind.urbanization => _showUrbanization,
+    };
+  }
 
   @override
   void dispose() {
@@ -103,6 +155,7 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
                 showClasses: _showingClasses,
                 aspectRatio: result.aspectRatio,
                 transform: _transform,
+                zoomEnabled: _zoomUnlocked,
               ),
             ),
             const SizedBox(width: 12),
@@ -118,6 +171,7 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
                 showClasses: _showingClasses,
                 aspectRatio: result.aspectRatio,
                 transform: _transform,
+                zoomEnabled: _zoomUnlocked,
               ),
             ),
           ],
@@ -126,6 +180,95 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
         _buildDifference(result),
       ],
     );
+  }
+
+  /// Where the change actually is, as coordinates.
+  ///
+  /// The picture shows the regions; this names them. A centre and a cell count
+  /// per region is what goes into a report — "deforestation happened" is not a
+  /// finding, "deforestation centred on 23.8012° N, 90.4231° E across 412 cells"
+  /// is.
+  List<Widget> _buildRegionList(AnalysisResult result) {
+    final sections = <({String title, Color color, List<ChangeRegion> regions})>[
+      if (_visible(ChangeKind.deforestation))
+        (
+          title: 'Deforestation',
+          color: kDeforestationColor,
+          regions: result.deforestationRegions
+        ),
+      if (_visible(ChangeKind.urbanization))
+        (
+          title: 'Urbanization',
+          color: kUrbanizationColor,
+          regions: result.urbanizationRegions
+        ),
+      if (_visible(ChangeKind.waterLoss))
+        (
+          title: 'Surface water loss',
+          color: kWaterLossColor,
+          regions: result.waterLossRegions
+        ),
+    ].where((s) => s.regions.isNotEmpty).toList();
+
+    if (sections.isEmpty) return const [];
+
+    return [
+      const SizedBox(height: 14),
+      Container(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: _line),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'WHERE',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.8,
+                color: _muted,
+              ),
+            ),
+            const SizedBox(height: 8),
+            for (final section in sections) ...[
+              for (var i = 0; i < section.regions.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: 10,
+                        height: 10,
+                        margin: const EdgeInsets.only(top: 3, right: 8),
+                        decoration: BoxDecoration(
+                          color: section.color,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      Expanded(
+                        child: _RegionRow(
+                          title: '${section.title} ${i + 1}',
+                          region: section.regions[i],
+                        ),
+                      ),
+                      Text(
+                        '${section.regions[i].points} cells',
+                        style: const TextStyle(fontSize: 12, color: _muted),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ],
+        ),
+      ),
+    ];
   }
 
   // ── The switch ───────────────────────────────────────────────────────────
@@ -245,6 +388,21 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
               ),
             ),
             IconButton(
+              onPressed: () {
+                setState(() => _zoomUnlocked = !_zoomUnlocked);
+                if (!_zoomUnlocked) _resetZoom();
+              },
+              tooltip: _zoomUnlocked
+                  ? 'Lock pictures (let the page scroll)'
+                  : 'Unlock zoom and pan',
+              visualDensity: VisualDensity.compact,
+              icon: Icon(
+                _zoomUnlocked ? Icons.lock_open : Icons.lock_outline,
+                size: 19,
+              ),
+              color: _zoomUnlocked ? _ink : _muted,
+            ),
+            IconButton(
               onPressed: _resetZoom,
               tooltip: 'Reset zoom',
               visualDensity: VisualDensity.compact,
@@ -258,6 +416,7 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
           aspectRatio: result.aspectRatio,
           maxHeight: _differenceMaxHeight,
           transform: _transform,
+          zoomEnabled: _zoomUnlocked,
           // Keyed off the counts the chips below display, not off the
           // `changes` list: the two disagree whenever the backend sends stats
           // without the per-pixel list, and a panel captioned "1205" over the
@@ -278,15 +437,26 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
             // The scrim is what lets a few hundred red pixels read against a
             // whole scene of ground.
             const ColoredBox(color: Color(0x8C0B0E12)),
-            // Water loss first, so deforestation wins where they touch.
-            if (_showWaterLoss && result.waterLossPng != null)
+            // Water loss first, then urbanisation, so deforestation wins
+            // where they overlap — ground that was cleared and built on is in
+            // both layers, and the clearing is the older fact.
+            if (_visible(ChangeKind.waterLoss) && result.waterLossPng != null)
               Image.memory(
                 result.waterLossPng!,
                 fit: BoxFit.fill,
                 filterQuality: FilterQuality.none,
                 gaplessPlayback: true,
               ),
-            if (_showDeforestation && result.deforestationPng != null)
+            if (_visible(ChangeKind.urbanization) &&
+                result.urbanizationPng != null)
+              Image.memory(
+                result.urbanizationPng!,
+                fit: BoxFit.fill,
+                filterQuality: FilterQuality.none,
+                gaplessPlayback: true,
+              ),
+            if (_visible(ChangeKind.deforestation) &&
+                result.deforestationPng != null)
               Image.memory(
                 result.deforestationPng!,
                 fit: BoxFit.fill,
@@ -300,22 +470,41 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
           spacing: 8,
           runSpacing: 8,
           children: [
-            _ChangeChip(
-              color: kDeforestationColor,
-              label: 'Deforestation',
-              count: deforestation,
-              selected: _showDeforestation,
-              onChanged: (v) => setState(() => _showDeforestation = v),
-            ),
-            _ChangeChip(
-              color: kWaterLossColor,
-              label: 'Water loss',
-              count: waterLoss,
-              selected: _showWaterLoss,
-              onChanged: (v) => setState(() => _showWaterLoss = v),
-            ),
+            // Only the chosen service's chip, and it does not toggle: it is the
+            // whole answer, so switching it off would leave an empty picture.
+            if (widget.only == null || widget.only == ChangeKind.deforestation)
+              _ChangeChip(
+                color: kDeforestationColor,
+                label: 'Deforestation',
+                count: deforestation,
+                selected: _visible(ChangeKind.deforestation),
+                onChanged: widget.only != null
+                    ? null
+                    : (v) => setState(() => _showDeforestation = v),
+              ),
+            if (widget.only == null || widget.only == ChangeKind.urbanization)
+              _ChangeChip(
+                color: kUrbanizationColor,
+                label: 'Urbanization',
+                count: result.urbanizationCount,
+                selected: _visible(ChangeKind.urbanization),
+                onChanged: widget.only != null
+                    ? null
+                    : (v) => setState(() => _showUrbanization = v),
+              ),
+            if (widget.only == null || widget.only == ChangeKind.waterLoss)
+              _ChangeChip(
+                color: kWaterLossColor,
+                label: 'Water loss',
+                count: waterLoss,
+                selected: _visible(ChangeKind.waterLoss),
+                onChanged: widget.only != null
+                    ? null
+                    : (v) => setState(() => _showWaterLoss = v),
+              ),
           ],
         ),
+        ..._buildRegionList(result),
         if ((result.stats?.uncertainPixels ?? 0) > 0) ...[
           const SizedBox(height: 10),
           Text(
@@ -331,10 +520,10 @@ class _BeforeAfterCompareState extends State<BeforeAfterCompare> {
         ],
         const SizedBox(height: 10),
         const Text(
-          'Tap a colour to show or hide it. Pinch or scroll any picture to '
-          'zoom — all three move together. Changed cells are drawn slightly '
-          'larger than their true 10 m footprint so they stay visible, but the '
-          'counts are exact.',
+          'Tap a colour to show or hide it. The pictures are locked so the page '
+          'scrolls; tap the padlock to zoom and pan them — all three move '
+          'together. Changed cells are drawn slightly larger than their true '
+          '10 m footprint so they stay visible, but the counts are exact.',
           style: TextStyle(fontSize: 11.5, height: 1.35, color: _muted),
         ),
       ],
@@ -354,6 +543,7 @@ class _ScenePane extends StatelessWidget {
   final bool showClasses;
   final double aspectRatio;
   final TransformationController transform;
+  final bool zoomEnabled;
 
   const _ScenePane({
     required this.label,
@@ -364,6 +554,7 @@ class _ScenePane extends StatelessWidget {
     required this.showClasses,
     required this.aspectRatio,
     required this.transform,
+    required this.zoomEnabled,
   });
 
   @override
@@ -402,6 +593,7 @@ class _ScenePane extends StatelessWidget {
           aspectRatio: aspectRatio,
           maxHeight: _paneMaxHeight,
           transform: transform,
+          zoomEnabled: zoomEnabled,
           children: [
             // Cross-fade rather than cut, so it reads as one piece of ground
             // being re-described rather than two unrelated pictures.
@@ -446,6 +638,10 @@ class _BoundedPicture extends StatelessWidget {
   final double maxHeight;
   final TransformationController transform;
 
+  /// When false the viewer ignores pan and scale, so scroll and drag fall
+  /// through to whatever is scrolling this page.
+  final bool zoomEnabled;
+
   /// Stacked bottom-first, each filling the frame exactly. These are the
   /// rasters, so they live *inside* the zoom and move with the ground.
   final List<Widget> children;
@@ -458,6 +654,7 @@ class _BoundedPicture extends StatelessWidget {
     required this.aspectRatio,
     required this.maxHeight,
     required this.transform,
+    required this.zoomEnabled,
     required this.children,
     this.overlay,
   });
@@ -480,6 +677,8 @@ class _BoundedPicture extends StatelessWidget {
                     transformationController: transform,
                     minScale: 1,
                     maxScale: 8,
+                    panEnabled: zoomEnabled,
+                    scaleEnabled: zoomEnabled,
                     child: Stack(fit: StackFit.expand, children: children),
                   ),
                   if (overlay != null) IgnorePointer(child: overlay),
@@ -594,31 +793,35 @@ class _LegendSwatch extends StatelessWidget {
   }
 }
 
-/// A colour-keyed chip that shows a change class's count and toggles its raster.
+/// A colour-keyed chip showing a change class's count, optionally toggling it.
+///
+/// [onChanged] is null when the chip is the only layer on screen: there is
+/// nothing to toggle against, and switching it off would just empty the picture.
 class _ChangeChip extends StatelessWidget {
   final Color color;
   final String label;
   final int count;
   final bool selected;
-  final ValueChanged<bool> onChanged;
+  final ValueChanged<bool>? onChanged;
 
   const _ChangeChip({
     required this.color,
     required this.label,
     required this.count,
     required this.selected,
-    required this.onChanged,
+    this.onChanged,
   });
 
   @override
   Widget build(BuildContext context) {
+    final toggle = onChanged;
     final enabled = count > 0;
     final active = selected && enabled;
     return Opacity(
       opacity: enabled ? 1 : 0.45,
       child: InkWell(
         borderRadius: BorderRadius.circular(20),
-        onTap: enabled ? () => onChanged(!selected) : null,
+        onTap: (enabled && toggle != null) ? () => toggle(!selected) : null,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(
@@ -688,6 +891,54 @@ class _NoChangeOverlay extends StatelessWidget {
                 fontWeight: FontWeight.w600,
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One region's name and Google Maps coordinate, tappable to copy.
+///
+/// A coordinate you can read but not move is half a result: the point of
+/// reporting a place is to go and look at it. Tapping copies the maps link, so
+/// it can be pasted into a browser, a message, or a report.
+class _RegionRow extends StatelessWidget {
+  final String title;
+  final ChangeRegion region;
+
+  const _RegionRow({required this.title, required this.region});
+
+  @override
+  Widget build(BuildContext context) {
+    final url = region.googleMapsUrl;
+    return InkWell(
+      onTap: url.isEmpty
+          ? null
+          : () {
+              Clipboard.setData(ClipboardData(text: url));
+              ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+                SnackBar(
+                  duration: const Duration(seconds: 2),
+                  content: Text('Copied maps link for $title'),
+                ),
+              );
+            },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 1),
+        child: Row(
+          children: [
+            Flexible(
+              child: Text(
+                '$title — ${region.coordinate}',
+                style: const TextStyle(fontSize: 12.5, color: _ink),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (url.isNotEmpty) ...[
+              const SizedBox(width: 6),
+              const Icon(Icons.copy_rounded, size: 13, color: _muted),
+            ],
           ],
         ),
       ),

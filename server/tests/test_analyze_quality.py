@@ -79,18 +79,15 @@ def test_analyze_uses_adaptive_full_months_and_rejects_under_observed_changes(
     )
 
     assert response.status_code == 200, response.get_data(as_text=True)
-    assert calls == [
-        {
-            "whole_month": True,
-            "min_clear_observations": 2,
-            "max_window_days": 60,
-        },
-        {
-            "whole_month": True,
-            "min_clear_observations": 2,
-            "max_window_days": 60,
-        },
-    ]
+    # Both dates must be composited identically, and with the project-wide
+    # window settings rather than numbers copied into the test -- a literal here
+    # just silently pins whatever the constants used to be.
+    expected_call = {
+        "whole_month": True,
+        "min_clear_observations": api_server.MIN_CLEAR_OBSERVATIONS,
+        "max_window_days": api_server.MAX_ADAPTIVE_WINDOW_DAYS,
+    }
+    assert calls == [expected_call, expected_call]
 
     body = response.get_json()
     assert body["changes"] == [{"Latitude": 23.75, "Longitude": 90.02, "mask": 1}]

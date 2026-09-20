@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 const Color _accent = Color(0xFFEF9A3D);
 
-/// The small two-button cluster on the right of the search bar:
-/// a layers toggle (satellite ↔ street) and a reset-selection-box button.
+/// The small two-button cluster on the right of the search bar: a layers toggle
+/// (satellite ↔ street) and a clear-the-tapped-corners button.
 class MapControls extends StatelessWidget {
   final bool satellite;
   final VoidCallback onToggleLayers;
@@ -43,7 +43,7 @@ class MapControls extends StatelessWidget {
           Container(width: 1, height: 26, color: Colors.black12),
           _IconButton(
             icon: Icons.crop_free,
-            tooltip: 'Reset selection box to map centre',
+            tooltip: 'Clear the tapped corners',
             active: false,
             onTap: onResetSelection,
           ),

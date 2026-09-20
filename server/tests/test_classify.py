@@ -21,9 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import api_server
 
 
-# Land cover the SCL layer already resolved (ClassID 4/5/6) is deterministic —
-# `expand_class` splits it on NDVI/NDBI. ClassID 7 goes to the model ensemble,
-# whose output we don't pin. (3, 3) is left as no-data.
+# Land cover the SCL layer already resolved: ClassID 4 and 6 split on NDVI, which
+# is a fixed threshold, so those labels are pinned exactly. ClassID 5 goes to the
+# trained soil/building sub-classifier, so those cells carry *real* reflectance
+# (see REAL_SOIL_ROWS / BUILT_UP_ROW below) rather than values chosen to trip a
+# threshold — a spectrally implausible pixel is out of the model's training
+# distribution and tells us nothing. ClassID 7 goes to the model ensemble, whose
+# output we don't pin. (3, 3) is left as no-data.
 BASE_CLASS_ID = np.array(
     [
         [4, 4, 5, 5, 6],
@@ -35,17 +39,48 @@ BASE_CLASS_ID = np.array(
 )
 
 EXPECTED = {
-    (0, 0): "Tree", (0, 1): "Crop", (0, 2): "Soil", (0, 3): "Soil", (0, 4): "Water",
+    (0, 0): "Tree", (0, 1): "Crop", (0, 2): "Building", (0, 3): "Soil", (0, 4): "Water",
     (1, 0): "Water", (1, 1): "Water", (1, 2): "Tree", (1, 3): "Crop", (1, 4): "Soil",
-    (3, 0): "Tree", (3, 1): "Soil", (3, 2): "Water", (3, 4): "Soil",
+    (3, 0): "Tree", (3, 1): "Building", (3, 2): "Crop", (3, 4): "Soil",
 }
 NO_DATA_CELL = (3, 3)
 
 CROP_CELLS = [(0, 1), (1, 3)]
-# Bare soil with NDBI > 0 — `expand_class` calls this Building, and the land-use
-# endpoint folds it back into Soil.
 BUILT_UP_CELLS = [(0, 2), (3, 1)]
 SOIL_CELLS = [(0, 3), (1, 4), (3, 4)]
+# ClassID 6 cells. Three carry real water; (3, 2) carries vegetation that SCL has
+# mislabelled, so the water guard has something to catch.
+WATER_CELLS = [(0, 4), (1, 0), (1, 1)]
+FAKE_WATER_CELLS = [(3, 2)]
+
+# Band order for the ClassID 5 cells below.
+SOIL_BANDS = ["B01", "B02", "B03", "B04", "B08", "B11", "B12"]
+
+# Real bare-soil reflectance: three rows lifted verbatim from the ground-truth
+# parquet (ClassID 5, soilClassifiedId 1) as recorded in the cell-5 output of
+# train_building_soil/model-train-urban.ipynb. If the sub-classifier stops
+# calling these Soil, something has genuinely regressed.
+REAL_SOIL_ROWS = [
+    [0.0291, 0.0872, 0.1296, 0.1492, 0.2754, 0.2736, 0.2130],
+    [0.0301, 0.1126, 0.1586, 0.1801, 0.2754, 0.2961, 0.2774],
+    [0.0294, 0.0533, 0.0886, 0.1022, 0.2277, 0.2305, 0.1720],
+]
+
+# A built-up signature: bright and spectrally flat across the visible, SWIR well
+# above NIR. That is what concrete and metal roofing look like, and it is the
+# shape the old `NDBI > 0` rule could not separate from dry soil.
+BUILT_UP_ROW = [0.150, 0.170, 0.195, 0.215, 0.235, 0.320, 0.300]
+
+# Real open water, back-solved from the medians measured over the Sundarbans
+# (NDVI -0.258, MNDWI +0.777, NIR 0.038, SWIR 0.012). The ClassID 6 cells need a
+# genuine water spectrum now, because `expand_class` no longer takes SCL's word
+# for it — a pixel carrying the vegetation defaults would be corrected to Tree.
+WATER_ROW = [0.050, 0.080, 0.0956, 0.0644, 0.0380, 0.0120, 0.008]
+
+# Vegetation that SCL wrongly calls water: exactly the failure seen at the Dhaka
+# fringe, where 2 213 cells came back Water with median NDVI +0.362 and
+# MNDWI -0.371. The guard must turn this back into Tree/Crop.
+FAKE_WATER_ROW = [0.030, 0.045, 0.0688, 0.0883, 0.1885, 0.1500, 0.110]
 
 POLYGON = [[90.00, 23.70], [90.10, 23.70], [90.10, 23.80], [90.00, 23.80]]
 
@@ -54,20 +89,37 @@ def _synthetic_composite() -> pd.DataFrame:
     """A DataFrame shaped exactly like `build_dataframe`'s 10 m output."""
     rows30, cols30 = BASE_CLASS_ID.shape
 
-    # Defaults give NDVI 0.82 (Tree) and NDBI -0.33 (Soil).
-    b04 = np.full((rows30, cols30), 0.05)
-    b08 = np.full((rows30, cols30), 0.50)
-    b11 = np.full((rows30, cols30), 0.15)
+    # Defaults give NDVI 0.82 -> Tree for the ClassID 4 cells.
+    bands = {
+        "B01": np.full((rows30, cols30), 0.10),
+        "B02": np.full((rows30, cols30), 0.08),
+        "B03": np.full((rows30, cols30), 0.12),
+        "B04": np.full((rows30, cols30), 0.05),
+        "B08": np.full((rows30, cols30), 0.50),
+        "B11": np.full((rows30, cols30), 0.15),
+        "B12": np.full((rows30, cols30), 0.10),
+    }
 
     for r, c in CROP_CELLS:  # NDVI 0.33 -> Crop
-        b04[r, c], b08[r, c] = 0.15, 0.30
-    for r, c in BUILT_UP_CELLS:  # NDBI 0.33 -> Building -> merged to Soil
-        b08[r, c], b11[r, c] = 0.20, 0.40
-    for r, c in SOIL_CELLS:  # NDBI -0.33 -> Soil
-        b08[r, c], b11[r, c] = 0.30, 0.15
+        bands["B04"][r, c], bands["B08"][r, c] = 0.15, 0.30
 
-    b02 = np.full((rows30, cols30), 0.08)
-    b02[NO_DATA_CELL] = np.nan  # residual cloud -> must stay transparent
+    # ClassID 5 cells get a whole real spectrum, not a tweaked band or two: the
+    # sub-classifier reads all seven, and AWEI (its dominant feature, 55% of
+    # total gain) depends on B03, B08, B11 and B12 together.
+    for (r, c), row in zip(SOIL_CELLS, REAL_SOIL_ROWS):
+        for name, value in zip(SOIL_BANDS, row):
+            bands[name][r, c] = value
+    for r, c in BUILT_UP_CELLS:
+        for name, value in zip(SOIL_BANDS, BUILT_UP_ROW):
+            bands[name][r, c] = value
+    for r, c in WATER_CELLS:
+        for name, value in zip(SOIL_BANDS, WATER_ROW):
+            bands[name][r, c] = value
+    for r, c in FAKE_WATER_CELLS:
+        for name, value in zip(SOIL_BANDS, FAKE_WATER_ROW):
+            bands[name][r, c] = value
+
+    bands["B02"][NO_DATA_CELL] = np.nan  # residual cloud -> must stay transparent
 
     def to_10m(arr):
         return np.repeat(np.repeat(arr, 3, axis=0), 3, axis=1).ravel()
@@ -81,13 +133,7 @@ def _synthetic_composite() -> pd.DataFrame:
         {
             "Longitude": lon_grid.ravel(),
             "Latitude": lat_grid.ravel(),
-            "B01": to_10m(np.full((rows30, cols30), 0.10)),
-            "B02": to_10m(b02),
-            "B03": to_10m(np.full((rows30, cols30), 0.12)),
-            "B04": to_10m(b04),
-            "B08": to_10m(b08),
-            "B11": to_10m(b11),
-            "B12": to_10m(np.full((rows30, cols30), 0.10)),
+            **{name: to_10m(arr) for name, arr in bands.items()},
             "ClassID": to_10m(BASE_CLASS_ID).astype(np.uint8),
         }
     )
@@ -144,8 +190,10 @@ def test_classify_labels_matches_expand_class_rules():
 
     assert grid[NO_DATA_CELL] == "", "NaN bands must stay unlabelled"
 
-    # Building must never surface: it is merged into Soil before we get here.
-    assert "Building" not in grid
+    # Built-up reaches the caller as its own label — nothing merges it away now.
+    # The two built-up cells and the three bare-soil cells are all ClassID 5, so
+    # the only thing telling them apart is the sub-classifier.
+    assert "Building" in grid
     allowed = set(api_server.LAND_COVER_COLORS) | {""}
     for c in range(5):
         assert grid[2, c] in allowed, f"ensemble emitted {grid[2, c]!r}"
@@ -249,14 +297,18 @@ def test_classify_endpoint_reports_class_stats(stub_pipeline):
     ).get_json()
 
     by_name = {c["name"]: c for c in body["classes"]}
-    assert set(by_name) == {"Tree", "Crop", "Water", "Soil"}
-    assert "Building" not in by_name
+    assert set(by_name) <= {"Tree", "Crop", "Water", "Soil", "Building"}
+    # Built-up is reported in its own right now, not folded into Soil.
+    assert "Building" in by_name
 
     # The 14 SCL-resolved cells are pinned; the 5 ensemble cells may add to any
     # class, and the no-data cell to none.
-    assert by_name["Water"]["pixels"] >= 4
+    # Three, not four: the fourth ClassID 6 cell carries vegetation spectra and
+    # the water guard correctly moves it to Crop.
+    assert by_name["Water"]["pixels"] >= 3
     assert by_name["Tree"]["pixels"] >= 3
-    assert by_name["Soil"]["pixels"] >= 5  # 3 bare soil + 2 folded-in built-up
+    assert by_name["Soil"]["pixels"] >= 3      # the three real bare-soil cells
+    assert by_name["Building"]["pixels"] >= 2  # the two built-up cells
     assert by_name["Crop"]["pixels"] >= 2
 
     assert body["stats"]["totalCells"] == 20

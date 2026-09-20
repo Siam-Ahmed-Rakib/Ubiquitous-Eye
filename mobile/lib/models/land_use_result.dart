@@ -7,8 +7,13 @@ import 'area_bounds.dart';
 /// The land-cover labels the backend classifier reports, and the colour the
 /// overlay paints each one. Mirrors `LAND_COVER_COLORS` in `server/api_server.py`.
 ///
-/// Built-up surfaces are not called out separately: the backend folds them back
-/// into `Soil`, the scene class they were split from.
+/// `Building` is split out of `Soil` by a trained sub-classifier — Sentinel-2's
+/// "Bare Soil" scene class covers bare ground and built-up surfaces alike. It
+/// takes the conventional cartographic red for built surfaces — a very dark
+/// one. A mid red disappears into the imagery over a city, where rooftops,
+/// brick kilns and dry ground are all reddish-brown at 10 m; nothing natural in
+/// these scenes is this dark and this saturated, so it reads as an annotation
+/// rather than as terrain.
 ///
 /// The map draws the raster at partial opacity, so these stay fully saturated.
 const Map<String, Color> kLandCoverPalette = {
@@ -16,6 +21,7 @@ const Map<String, Color> kLandCoverPalette = {
   'Crop': Color(0xFF9CCC65),
   'Water': Color(0xFF1565C0),
   'Soil': Color(0xFFA1887F),
+  'Building': Color(0xFF6D000A),
 };
 
 /// One land-cover type's share of a classified area.

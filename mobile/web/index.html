@@ -33,6 +33,37 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
+  <!--
+    Tear down any service worker this origin registered previously.
+
+    Flutter's default PWA build installs one that caches main.dart.js and serves
+    it from that cache on later loads, ignoring the `Cache-Control: no-cache`
+    the backend sends. After a redeploy that produces a half-updated UI: data
+    fetched from the API is current, while everything compiled into the bundle —
+    colours, labels, layout — is whatever it was when the cache was filled.
+
+    The build now passes --pwa-strategy=none so nothing new registers, but a
+    browser that visited before this change still has the old worker installed
+    and would keep serving the stale bundle indefinitely. This unregisters it
+    and drops its caches, so those visitors recover on their next load instead
+    of having to clear site data by hand. Harmless once none is present.
+  -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations()
+        .then(function (registrations) {
+          for (var i = 0; i < registrations.length; i++) {
+            registrations[i].unregister();
+          }
+        })
+        .catch(function () { /* nothing registered, or blocked; either is fine */ });
+      if (window.caches && caches.keys) {
+        caches.keys()
+          .then(function (names) { names.forEach(function (n) { caches.delete(n); }); })
+          .catch(function () { /* no cache storage available */ });
+      }
+    }
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

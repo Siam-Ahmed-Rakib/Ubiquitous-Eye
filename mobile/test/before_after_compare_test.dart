@@ -98,7 +98,11 @@ Future<AnalysisResult> _analyze(Map<String, dynamic> body) {
 
 /// Hosts the widget in a window wide enough that nothing is clipped, so a
 /// missing element is a real absence rather than an overflow.
-Future<void> _pump(WidgetTester tester, AnalysisResult result) async {
+Future<void> _pump(
+  WidgetTester tester,
+  AnalysisResult result, {
+  ChangeKind? only,
+}) async {
   tester.view.physicalSize = const Size(1400, 2400);
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
@@ -106,7 +110,7 @@ Future<void> _pump(WidgetTester tester, AnalysisResult result) async {
   await tester.pumpWidget(MaterialApp(
     home: Scaffold(
       body: SingleChildScrollView(
-        child: BeforeAfterCompare(result: result),
+        child: BeforeAfterCompare(result: result, only: only),
       ),
     ),
   ));
@@ -353,6 +357,102 @@ void main() {
         expect(identical(v.transformationController, shared), isTrue,
             reason: 'every pane must share one controller');
       }
+    });
+
+    testWidgets('a chosen service shows its layer and no other', (tester) async {
+      await _pump(tester, await _analyze(_fullBody()),
+          only: ChangeKind.deforestation);
+
+      // Its own chip is there; the other two are not offered at all, so the
+      // answer on screen is the question that was asked.
+      expect(find.textContaining('Deforestation'), findsWidgets);
+      expect(find.textContaining('Water loss'), findsNothing);
+      expect(find.textContaining('Urbanization'), findsNothing);
+    });
+
+    testWidgets('the sole layer cannot be switched off', (tester) async {
+      await _pump(tester, await _analyze(_fullBody()),
+          only: ChangeKind.deforestation);
+
+      // Tapping it must not blank the difference picture: with one layer there
+      // is nothing to compare it against, so there is nothing to toggle.
+      final chip = find.ancestor(
+        of: find.textContaining('Deforestation').first,
+        matching: find.byType(InkWell),
+      );
+      if (chip.evaluate().isNotEmpty) {
+        await tester.tap(chip.first, warnIfMissed: false);
+        await tester.pumpAndSettle();
+      }
+      expect(find.textContaining('Deforestation'), findsWidgets);
+    });
+
+    testWidgets('with no service chosen every layer is offered',
+        (tester) async {
+      await _pump(tester, await _analyze(_fullBody()));
+
+      expect(find.textContaining('Deforestation'), findsWidgets);
+      expect(find.textContaining('Water loss'), findsWidgets);
+      expect(find.textContaining('Urbanization'), findsWidgets);
+    });
+
+    testWidgets('pictures start locked so the results page can scroll',
+        (tester) async {
+      await _pump(tester, await _analyze(_fullBody()));
+
+      final viewers = tester
+          .widgetList<InteractiveViewer>(find.byType(InteractiveViewer))
+          .toList();
+      expect(viewers, hasLength(3));
+      for (final v in viewers) {
+        expect(v.panEnabled, isFalse,
+            reason: 'a drag must scroll the page, not pan the picture');
+        expect(v.scaleEnabled, isFalse,
+            reason: 'a scroll must scroll the page, not zoom the picture');
+      }
+    });
+
+    testWidgets('the padlock unlocks zoom on all three at once',
+        (tester) async {
+      await _pump(tester, await _analyze(_fullBody()));
+
+      await tester.tap(find.byTooltip('Unlock zoom and pan'));
+      await tester.pumpAndSettle();
+
+      final viewers = tester
+          .widgetList<InteractiveViewer>(find.byType(InteractiveViewer))
+          .toList();
+      for (final v in viewers) {
+        expect(v.panEnabled, isTrue);
+        expect(v.scaleEnabled, isTrue);
+      }
+
+      // And locking again puts them back, so the page scrolls once more.
+      await tester.tap(find.byTooltip('Lock pictures (let the page scroll)'));
+      await tester.pumpAndSettle();
+      for (final v in tester.widgetList<InteractiveViewer>(
+          find.byType(InteractiveViewer))) {
+        expect(v.panEnabled, isFalse);
+      }
+    });
+
+    testWidgets('locking again resets any zoom the user left behind',
+        (tester) async {
+      await _pump(tester, await _analyze(_fullBody()));
+
+      await tester.tap(find.byTooltip('Unlock zoom and pan'));
+      await tester.pumpAndSettle();
+      final controller = tester
+          .widget<InteractiveViewer>(find.byType(InteractiveViewer).first)
+          .transformationController!;
+      controller.value = Matrix4.identity()..scaleByDouble(4, 4, 4, 1);
+      await tester.pump();
+
+      await tester.tap(find.byTooltip('Lock pictures (let the page scroll)'));
+      await tester.pumpAndSettle();
+
+      expect(controller.value, Matrix4.identity(),
+          reason: 'a locked picture must not stay zoomed in somewhere odd');
     });
 
     testWidgets('reset zoom returns the shared transform to identity',

@@ -55,8 +55,12 @@ class AnalyticsService {
   });
 }
 
-/// The seven services Ubiquitous Eyes provides. Names chosen for clarity; the
-/// detection intent the user described is captured in each description.
+/// The six services Ubiquitous Eyes provides.
+///
+/// Three are change detections over a pair of dates, and each is *directional* —
+/// it asks what was lost or gained, not merely what differs. Three are
+/// single-date products. Nothing here is a generic "difference" service: an
+/// undirected comparison cannot answer any of the questions these are for.
 const List<AnalyticsService> kAnalyticsServices = [
   AnalyticsService(
     id: 'deforestation',
@@ -65,36 +69,38 @@ const List<AnalyticsService> kAnalyticsServices = [
     icon: Icons.forest_outlined,
     gradient: [Color(0xFF1B5E20), Color(0xFF66BB6A)],
     description:
-        'Detects and measures forest loss over time by comparing multi-date '
-        'satellite imagery. Newly cleared patches are highlighted, the rate of '
-        'canopy loss is tracked, and likely illegal logging or land clearing is '
-        'flagged inside your selected area. Built for conservation monitoring, '
-        'carbon reporting, and enforcement.',
+        'Finds forest that has gone. A pixel is reported when it was tree cover '
+        'at the earlier date and is not tree cover now, whatever replaced it — '
+        'newly grown canopy is deliberately not counted. Built for conservation '
+        'monitoring, carbon reporting, and enforcement against illegal logging '
+        'or land clearing.',
   ),
   AnalyticsService(
-    id: 'land_encroachment',
-    name: 'Land Encroachment',
+    id: 'urbanization',
+    name: 'Urbanization',
     categories: [ServiceCategory.urbanPlanning, ServiceCategory.realEstate],
-    icon: Icons.maps_home_work_outlined,
-    gradient: [Color(0xFF37474F), Color(0xFF90A4AE)],
+    icon: Icons.location_city_outlined,
+    gradient: [Color(0xFF4A148C), Color(0xFFBA68C8)],
     description:
-        'Identifies new construction on land that was previously empty or '
-        'restricted. By comparing imagery across dates, the service flags '
-        'buildings, structures, and paved surfaces that have appeared on vacant '
-        'plots — supporting zoning enforcement, detection of unauthorised '
-        'development, and land-rights monitoring.',
+        'Finds ground that has been built on since the earlier date. Only new '
+        'construction counts: a pixel is reported when there was no building '
+        'before and there is one now, so long-standing built-up areas stay '
+        'quiet and the map shows growth rather than extent. Built for zoning '
+        'enforcement, unauthorised-development detection, and tracking how a '
+        'city spreads.',
   ),
   AnalyticsService(
-    id: 'water_body_encroachment',
-    name: 'Water Body Encroachment',
+    id: 'surface_water_loss',
+    name: 'Surface Water Loss Detection',
     categories: [ServiceCategory.environmental, ServiceCategory.urbanPlanning],
     icon: Icons.water_outlined,
     gradient: [Color(0xFF01579B), Color(0xFF4FC3F7)],
     description:
-        'Detects the filling, reclamation, or shrinking of rivers, canals, '
-        'lakes, and wetlands. The service compares water extent across time to '
-        'reveal where a water body has been filled in or built over, helping '
-        'authorities protect floodplains, drainage, and natural water flow.',
+        'Finds water that has disappeared. A pixel is reported when it was '
+        'water at the earlier date and is not water now — whether it was '
+        'filled, drained, or built over — while newly flooded ground is left '
+        'out. Reveals shrinking rivers, canals, lakes, and wetlands for '
+        'floodplain and drainage protection.',
   ),
   AnalyticsService(
     id: 'land_use_classification',
@@ -112,18 +118,6 @@ const List<AnalyticsService> kAnalyticsServices = [
         'drawn over the map, it gives a clear, up-to-date picture of how land '
         'is used across your area of interest, ready for planning and change '
         'analysis.',
-  ),
-  AnalyticsService(
-    id: 'vegetation',
-    name: 'Vegetation',
-    categories: [ServiceCategory.agriculture, ServiceCategory.environmental],
-    icon: Icons.grass_outlined,
-    gradient: [Color(0xFF2E7D32), Color(0xFF9CCC65)],
-    description:
-        'Maps the presence, density, and spread of vegetation across your area '
-        'of interest. Green cover is separated from built and bare surfaces to '
-        'give a clear picture of tree canopy, croplands, parks, and natural '
-        'growth.',
   ),
   AnalyticsService(
     id: 'ndvi',

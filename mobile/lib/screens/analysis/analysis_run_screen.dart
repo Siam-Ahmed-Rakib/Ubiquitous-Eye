@@ -229,7 +229,10 @@ class _AnalysisRunScreenState extends State<AnalysisRunScreen> {
               ],
               _buildViewToggle(),
               const SizedBox(height: 16),
-              BeforeAfterCompare(result: result),
+              BeforeAfterCompare(
+                result: result,
+                only: ChangeKind.forServiceId(widget.service?.id),
+              ),
               const SizedBox(height: 20),
               const Divider(height: 1),
               const SizedBox(height: 18),

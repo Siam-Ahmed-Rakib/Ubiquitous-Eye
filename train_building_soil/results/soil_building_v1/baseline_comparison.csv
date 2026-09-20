@@ -1,0 +1,3 @@
+model,accuracy,precision,recall,f1,mcc
+NDBI > 0 rule (current pipeline),0.4835,0.0287,0.0087,0.0133,-0.283
+soil_building_v1 (this notebook),0.9722,0.9496,0.983,0.966,0.9429

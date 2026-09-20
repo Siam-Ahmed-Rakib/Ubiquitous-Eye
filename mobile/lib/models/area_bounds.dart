@@ -32,6 +32,32 @@ class AreaBounds {
     );
   }
 
+  /// The axis-aligned area covering every point in [points].
+  ///
+  /// Tapping corners is far easier on a phone than dragging small handles, but
+  /// the four taps rarely form a neat rectangle — and they do not need to. The
+  /// backend takes a polygon and immediately reduces it to its bounding box
+  /// (`BBox(min(lons), min(lats), max(lons), max(lats))` in
+  /// `run_composite_pipeline`), so the enclosing box *is* the area that gets
+  /// analysed. Building it here keeps the map showing exactly what the server
+  /// will use, rather than a quadrilateral that quietly becomes something else.
+  factory AreaBounds.fromPoints(List<LatLng> points) {
+    if (points.isEmpty) {
+      throw ArgumentError('need at least one point to build an area');
+    }
+    var north = points.first.latitude;
+    var south = points.first.latitude;
+    var east = points.first.longitude;
+    var west = points.first.longitude;
+    for (final p in points.skip(1)) {
+      if (p.latitude > north) north = p.latitude;
+      if (p.latitude < south) south = p.latitude;
+      if (p.longitude > east) east = p.longitude;
+      if (p.longitude < west) west = p.longitude;
+    }
+    return AreaBounds(north: north, south: south, east: east, west: west);
+  }
+
   LatLng get nw => LatLng(north, west);
   LatLng get ne => LatLng(north, east);
   LatLng get sw => LatLng(south, west);

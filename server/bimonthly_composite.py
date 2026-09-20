@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import calendar
 import logging
+import os
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -174,7 +176,17 @@ RESOLUTION = 30  # metres
 # window evenly around it only when some pixels still lack enough clear looks.
 MIN_CLEAR_OBSERVATIONS = 2
 ADAPTIVE_EXPANSION_DAYS = 15
-MAX_ADAPTIVE_WINDOW_DAYS = 60
+
+# Every composite spans at least this many days, whatever month was asked for. A
+# single calendar month is not enough imagery: January 2017 over Dhaka has one
+# Sentinel-2 acquisition, so the SCL layer came from a single scene and 55% of
+# the area fell through to the model ensemble. Sixty days centred on the
+# requested month roughly doubles the passes available before any cloud gate is
+# considered.
+BASE_COMPOSITE_DAYS = 60
+
+# The gate may widen the window to here when pixels still lack clear looks.
+MAX_ADAPTIVE_WINDOW_DAYS = 90
 
 SCL_CLASS_DICT = {
     0: "No Data", 1: "Saturated", 2: "Dark Area Pixels",
@@ -184,16 +196,69 @@ SCL_CLASS_DICT = {
 }
 
 
+# ── Which Sentinel Hub deployment ─────────────────────────────
+# There are two, and a credential works on exactly one of them. Copernicus Data
+# Space (CDSE) issues client ids prefixed "sh-" and runs its own identity server;
+# the legacy Sentinel Hub deployment rejects such a credential at the token
+# exchange with `invalid_client`, which reads like a typo'd secret rather than
+# what it is. Pick the deployment from the credential instead of asking anyone to
+# remember, and allow either to be forced.
+LEGACY_BASE_URL = "https://services.sentinel-hub.com"
+LEGACY_TOKEN_URL = f"{LEGACY_BASE_URL}/auth/realms/main/protocol/openid-connect/token"
+CDSE_BASE_URL = "https://sh.dataspace.copernicus.eu"
+CDSE_TOKEN_URL = (
+    "https://identity.dataspace.copernicus.eu"
+    "/auth/realms/CDSE/protocol/openid-connect/token"
+)
+
+
+def sh_endpoints(client_id: str) -> tuple[str, str]:
+    """`(base_url, token_url)` for this credential. SH_BASE_URL/SH_TOKEN_URL win."""
+    if str(client_id or "").startswith("sh-"):
+        base, token = CDSE_BASE_URL, CDSE_TOKEN_URL
+    else:
+        base, token = LEGACY_BASE_URL, LEGACY_TOKEN_URL
+    return os.environ.get("SH_BASE_URL") or base, os.environ.get("SH_TOKEN_URL") or token
+
+
+# A DataCollection carries its own `service_url`, and the Process API honours
+# that over `config.sh_base_url` — while the Catalog API does the opposite. So
+# pointing the config at CDSE is not enough: SENTINEL2_L2A still ships with the
+# legacy host baked in, and process requests would 401 while catalog searches
+# succeeded. The collection has to be rebound as well. `define_from` refuses to
+# register the same definition twice, hence the cache.
+_S2_COLLECTIONS: dict[str, DataCollection] = {}
+
+
+def s2_collection(base_url: str | None = None) -> DataCollection:
+    """SENTINEL2_L2A bound to `base_url` (the stock collection for legacy)."""
+    base_url = base_url or LEGACY_BASE_URL
+    if base_url == LEGACY_BASE_URL:
+        return DataCollection.SENTINEL2_L2A
+    if base_url not in _S2_COLLECTIONS:
+        suffix = re.sub(r"[^0-9A-Za-z]+", "_", base_url).strip("_").upper()
+        _S2_COLLECTIONS[base_url] = DataCollection.SENTINEL2_L2A.define_from(
+            f"SENTINEL2_L2A_{suffix}", service_url=base_url,
+        )
+    return _S2_COLLECTIONS[base_url]
+
+
 # ── Config builders ───────────────────────────────────────────
 
 def build_s2_config(client_id: str, client_secret: str) -> SHConfig:
+    base_url, token_url = sh_endpoints(client_id)
     return SHConfig(
         sh_client_id=client_id,
         sh_client_secret=client_secret,
-        sh_base_url="https://services.sentinel-hub.com",
+        sh_base_url=base_url,
+        sh_token_url=token_url,
     )
 
 
+# Landsat lives on the legacy US-West deployment and is **not served by CDSE** —
+# a catalog search there answers 500. These stay pointed at the legacy hosts, so
+# with a CDSE credential the Landsat searches simply fail and are skipped; see
+# `search_dates_optional`. Sentinel-2 alone is what the classifier needs.
 def build_ls_catalog_config(client_id: str, client_secret: str) -> SHConfig:
     return SHConfig(
         sh_client_id=client_id,
@@ -246,11 +311,21 @@ def adaptive_windows(
 ) -> list[tuple[date, date]]:
     """Return the base window followed by balanced expansions up to ``max_days``.
 
-    The first expansion adds 15 total days. The last reaches the cap exactly,
-    avoiding an unnecessary one-day final attempt for February.
+    The first window is never shorter than ``BASE_COMPOSITE_DAYS`` — a calendar
+    month on its own does not yield enough clear passes — so a month request is
+    widened to 60 days before a single scene is fetched. Expansions then add 15
+    days at a time, and the last reaches the cap exactly rather than making a
+    pointless one-day final attempt.
+
+    Every window stays centred on the requested month: the extra days are split
+    evenly before and after it, so the composite still represents that month
+    rather than drifting to one side of it.
     """
-    base_days = (end - start).days + 1
-    if max_days < base_days:
+    month_days = (end - start).days + 1
+    # The floor cannot exceed the cap, and a caller asking for a window longer
+    # than the floor keeps its own length.
+    base_days = min(max(month_days, BASE_COMPOSITE_DAYS), max_days)
+    if max_days < month_days:
         raise ValueError("max_days cannot be shorter than the base date window")
 
     targets = [base_days]
@@ -261,7 +336,10 @@ def adaptive_windows(
 
     windows = []
     for target_days in targets:
-        extra = target_days - base_days
+        # Measured against the requested month, not against the floor: the first
+        # target is already wider than the month, and that widening is exactly
+        # what has to be split around it.
+        extra = target_days - month_days
         before = extra // 2
         after = extra - before
         window_start = start - timedelta(days=before)
@@ -315,11 +393,34 @@ def search_dates(collection, bbox, start, end, catalog_cfg, max_cloud_coverage: 
     return dates
 
 
+def search_dates_optional(
+    collection, bbox, start, end, catalog_cfg, max_cloud_coverage: float | None = None,
+):
+    """`search_dates` for a source we can do without.
+
+    Landsat is a supplementary source: it fills gaps when Sentinel-2 is cloudy,
+    and the per-scene fetches are already best-effort. But the *catalog* query
+    was not, so one unavailable deployment took the whole request down with it —
+    which is what happens on a CDSE credential, where Landsat answers 500.
+
+    Mirrors `search_dates`' signature exactly, including `max_cloud_coverage`, so
+    the two cannot drift: a caller that starts filtering by cloud cover gets the
+    same behaviour whichever one it calls.
+    """
+    try:
+        return search_dates(collection, bbox, start, end, catalog_cfg, max_cloud_coverage)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "  %s catalog unavailable (%s); continuing without it",
+            getattr(collection, "api_id", collection), exc)
+        return []
+
+
 def fetch_s2(date_str, bbox, size, config):
     req = SentinelHubRequest(
         evalscript=EVALSCRIPT_S2,
         input_data=[SentinelHubRequest.input_data(
-            data_collection=DataCollection.SENTINEL2_L2A,
+            data_collection=s2_collection(config.sh_base_url),
             time_interval=(f"{date_str}T00:00:00Z", f"{date_str}T23:59:59Z"),
             mosaicking_order="leastCC",
         )],
@@ -418,7 +519,7 @@ def fetch_true_color_base(
     req = SentinelHubRequest(
         evalscript=EVALSCRIPT_TRUE_COLOR,
         input_data=[SentinelHubRequest.input_data(
-            data_collection=DataCollection.SENTINEL2_L2A,
+            data_collection=s2_collection(cfg.sh_base_url),
             time_interval=(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
             mosaicking_order="leastCC",
         )],
@@ -488,8 +589,8 @@ def collect_half(half_start, half_end, bbox, aoi_size, s2_cfg, ls_catalog_cfg, l
 
     band_stack: list[np.ndarray] = []
     scl_stack: list[np.ndarray] = []
-    s2_dates = search_dates(DataCollection.SENTINEL2_L2A, bbox, half_start, half_end, s2_cfg)
-    ls_dates = search_dates(DataCollection.LANDSAT_OT_L2, bbox, half_start, half_end, ls_catalog_cfg)
+    s2_dates = search_dates(s2_collection(s2_cfg.sh_base_url), bbox, half_start, half_end, s2_cfg)
+    ls_dates = search_dates_optional(DataCollection.LANDSAT_OT_L2, bbox, half_start, half_end, ls_catalog_cfg)
     _extend_collection(
         half_start, half_end, s2_dates, ls_dates, bbox, aoi_size, s2_cfg, ls_cfg,
         band_stack, scl_stack, set(), set(),
@@ -531,8 +632,8 @@ def collect_adaptive(
 
     # Catalog queries are cheap compared with raster downloads. Search the full
     # possible range once, then fetch only dates admitted by each expansion.
-    s2_dates = search_dates(DataCollection.SENTINEL2_L2A, bbox, search_start, search_end, s2_cfg)
-    ls_dates = search_dates(DataCollection.LANDSAT_OT_L2, bbox, search_start, search_end, ls_catalog_cfg)
+    s2_dates = search_dates(s2_collection(s2_cfg.sh_base_url), bbox, search_start, search_end, s2_cfg)
+    ls_dates = search_dates_optional(DataCollection.LANDSAT_OT_L2, bbox, search_start, search_end, ls_catalog_cfg)
 
     band_stack: list[np.ndarray] = []
     scl_stack: list[np.ndarray] = []

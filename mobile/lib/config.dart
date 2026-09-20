@@ -32,3 +32,17 @@ const String _configuredBackendUrl = String.fromEnvironment('BACKEND_URL');
 final String kBackendBaseUrl = _configuredBackendUrl.isNotEmpty
     ? _configuredBackendUrl
     : (kIsWeb ? Uri.base.origin : 'http://localhost:5000');
+
+/// How long the client waits for a classification or change-detection request.
+///
+/// These requests are genuinely slow: the backend searches the Sentinel Hub
+/// catalogue, downloads every clear acquisition in the window, builds a temporal
+/// median composite and then classifies every cell. A month over a small area is
+/// a couple of minutes; a large area, or one that makes the adaptive compositor
+/// widen its window looking for clear looks, is much longer.
+///
+/// **Keep this at or below gunicorn's `--timeout` in `server/Dockerfile`.** If
+/// the client waits longer than the server is willing to work, gunicorn kills
+/// the worker and the browser sits there until its own timer runs out, reporting
+/// a connection problem for what was really a server-side abort.
+const Duration kBackendRequestTimeout = Duration(minutes: 30);

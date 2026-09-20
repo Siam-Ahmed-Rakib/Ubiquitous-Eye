@@ -61,7 +61,7 @@ class LandUseService {
             headers: const {'Content-Type': 'application/json'},
             body: jsonEncode({'polygon': polygon, 'year': year, 'month': month}),
           )
-          .timeout(const Duration(minutes: 5));
+          .timeout(kBackendRequestTimeout);
     } catch (e) {
       throw LandUseException(
         'Could not reach the backend at $_baseUrl.\n'
@@ -137,6 +137,7 @@ const int _sampleGrid = 192;
 const Map<String, List<int>> _sampleSceneColors = {
   'Water': [26, 58, 92],
   'Soil': [142, 122, 96],
+  'Building': [132, 128, 124],
   'Crop': [118, 138, 68],
   'Tree': [28, 64, 34],
 };
@@ -155,9 +156,11 @@ Future<LandUseResult> sampleLandUse({
   int seed = 42,
 }) async {
   // Ordered by the noise band each class occupies, low to high: water sits in
-  // the hollows, tree cover on the high ground.
-  const bands = <String>['Water', 'Soil', 'Crop', 'Tree'];
-  const thresholds = <double>[0.34, 0.48, 0.66];
+  // the hollows, tree cover on the high ground, and built-up surfaces sit on the
+  // dry ground just above bare soil. The Soil/Crop boundaries are unchanged;
+  // Building is carved out of the middle of that range.
+  const bands = <String>['Water', 'Soil', 'Building', 'Crop', 'Tree'];
+  const thresholds = <double>[0.34, 0.44, 0.53, 0.66];
 
   final mask = Uint8List(_sampleGrid * _sampleGrid * 4);
   final scene = Uint8List(_sampleGrid * _sampleGrid * 4);

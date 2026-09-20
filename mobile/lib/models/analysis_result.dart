@@ -9,8 +9,9 @@ import 'land_use_result.dart';
 /// Colour per `mask` value, matching `CHANGE_COLORS` in `server/api_server.py`.
 const Color kDeforestationColor = Color(0xFFE53935); // mask 1 — vegetation loss
 const Color kWaterLossColor = Color(0xFFFB8C00); // mask 2 — surface-water loss
+const Color kUrbanizationColor = Color(0xFF8E24AA); // mask 3 — new built-up
 
-/// The three ground types the before/after class map paints, in the order a
+/// The four ground types the before/after class map paints, in the order a
 /// legend should list them.
 ///
 /// Each colour is the *mid* stop of that class's ramp in `CLASS_MAP_RAMPS`
@@ -21,12 +22,14 @@ const Map<String, Color> kClassMapPalette = {
   'Tree': Color(0xFF2D7D32),
   'Water': Color(0xFF1565C0),
   'Soil': Color(0xFFB08968),
+  'Building': Color(0xFF6D000A),
 };
 
 /// A single changed pixel from the backend change-detection pipeline.
 ///
 /// The backend encodes the kind of change in `mask`:
 ///  * `1` → forest / vegetation loss (deforestation)
+///  * `3` → new built-up surface (urbanisation)
 ///  * `2` → surface-water loss
 class ChangePoint {
   final LatLng location;
@@ -36,6 +39,7 @@ class ChangePoint {
 
   bool get isDeforestation => mask == 1;
   bool get isWaterLoss => mask == 2;
+  bool get isUrbanization => mask == 3;
 }
 
 /// Aggregate counts for one analysis run (mirrors the backend `stats` object).
@@ -50,6 +54,7 @@ class AnalysisStats {
 
   final int deforestation;
   final int waterLoss;
+  final int urbanization;
   final String oldDate;
   final String newDate;
 
@@ -66,6 +71,7 @@ class AnalysisStats {
     this.minimumClearObservations = 0,
     required this.deforestation,
     required this.waterLoss,
+    required this.urbanization,
     required this.oldDate,
     required this.newDate,
     this.oldWindow = '',
@@ -80,11 +86,73 @@ class AnalysisStats {
             (json['minimumClearObservations'] as num?)?.toInt() ?? 0,
         deforestation: (json['deforestation'] as num?)?.toInt() ?? 0,
         waterLoss: (json['waterLoss'] as num?)?.toInt() ?? 0,
+        urbanization: (json['urbanization'] as num?)?.toInt() ?? 0,
         oldDate: json['oldDate']?.toString() ?? '',
         newDate: json['newDate']?.toString() ?? '',
         oldWindow: json['oldWindow']?.toString() ?? '',
         newWindow: json['newWindow']?.toString() ?? '',
       );
+}
+
+/// One region where a change was found, as the backend clustered it.
+///
+/// The changed cells are grouped and each group described by the ellipse that
+/// fits it, so a result names places rather than listing thousands of pixels.
+/// [centre] is what goes in a report; the ellipse is what gets drawn.
+class ChangeRegion {
+  final LatLng centre;
+  final double semiMajorDeg;
+  final double semiMinorDeg;
+  final double angleDeg;
+
+  /// How many changed cells this region covers.
+  final int points;
+
+  /// The centre in Google Maps order and formatting — `lat, lng`. Comes from
+  /// the backend already formatted, so the lat/lng swap that drops a pin in the
+  /// wrong hemisphere can only be got wrong in one place.
+  final String coordinate;
+
+  /// A maps link to the centre, ready to open or paste.
+  final String googleMapsUrl;
+
+  const ChangeRegion({
+    required this.centre,
+    required this.semiMajorDeg,
+    required this.semiMinorDeg,
+    required this.angleDeg,
+    required this.points,
+    required this.coordinate,
+    required this.googleMapsUrl,
+  });
+
+  factory ChangeRegion.fromJson(Map<String, dynamic> json) => ChangeRegion(
+        centre: LatLng(
+          (json['centerLat'] as num?)?.toDouble() ?? 0,
+          (json['centerLon'] as num?)?.toDouble() ?? 0,
+        ),
+        semiMajorDeg: (json['semiMajorDeg'] as num?)?.toDouble() ?? 0,
+        semiMinorDeg: (json['semiMinorDeg'] as num?)?.toDouble() ?? 0,
+        angleDeg: (json['angleDeg'] as num?)?.toDouble() ?? 0,
+        points: (json['points'] as num?)?.toInt() ?? 0,
+        coordinate: json['coordinate']?.toString() ??
+            '${((json['centerLat'] as num?)?.toDouble() ?? 0).toStringAsFixed(6)}, '
+                '${((json['centerLon'] as num?)?.toDouble() ?? 0).toStringAsFixed(6)}',
+        googleMapsUrl: json['googleMapsUrl']?.toString() ?? '',
+      );
+
+  /// What to show: the Google Maps coordinate, which pastes straight into the
+  /// search box. A decorated `23.8012° N` form reads nicely and cannot be
+  /// pasted anywhere useful, which is the wrong trade for a field report.
+  String get label => coordinate;
+
+  static List<ChangeRegion> listFrom(dynamic raw) {
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((e) => ChangeRegion.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
 }
 
 /// Parsed response from `POST /api/sentinel/analyze`.
@@ -117,9 +185,21 @@ class AnalysisResult {
   final List<LandCoverClass> oldClasses;
   final List<LandCoverClass> newClasses;
 
-  /// One raster per change class, so each can be toggled on its own.
+  /// One raster per change class, so the screen can show exactly the one the
+  /// chosen service is about.
+  ///
+  /// They are not mutually exclusive: ground that was cleared and then built on
+  /// appears in both [deforestationPng] and [urbanizationPng], because it is
+  /// genuinely both.
   final Uint8List? deforestationPng;
   final Uint8List? waterLossPng;
+  final Uint8List? urbanizationPng;
+
+  /// Where each change happened, largest region first. Empty when the change
+  /// was too sparse to describe as regions, or when an older server answered.
+  final List<ChangeRegion> deforestationRegions;
+  final List<ChangeRegion> waterLossRegions;
+  final List<ChangeRegion> urbanizationRegions;
 
   final int imageWidth;
   final int imageHeight;
@@ -141,6 +221,10 @@ class AnalysisResult {
     this.newClasses = const [],
     this.deforestationPng,
     this.waterLossPng,
+    this.urbanizationPng,
+    this.deforestationRegions = const [],
+    this.waterLossRegions = const [],
+    this.urbanizationRegions = const [],
     this.imageWidth = 0,
     this.imageHeight = 0,
     this.imageBounds,
@@ -153,6 +237,9 @@ class AnalysisResult {
   int get waterLossCount =>
       stats?.waterLoss ?? changes.where((c) => c.isWaterLoss).length;
 
+  int get urbanizationCount =>
+      stats?.urbanization ?? changes.where((c) => c.isUrbanization).length;
+
   bool get hasChanges => changes.isNotEmpty;
 
   /// Whether both dates' scenes came back, so a before/after view is possible.
@@ -164,7 +251,10 @@ class AnalysisResult {
   bool get hasClassMaps => oldClassPng != null && newClassPng != null;
 
   /// Whether a changed-pixel raster exists to draw the difference view from.
-  bool get hasChangeRasters => deforestationPng != null || waterLossPng != null;
+  bool get hasChangeRasters =>
+      deforestationPng != null ||
+      waterLossPng != null ||
+      urbanizationPng != null;
 
   /// Shape of the rasters. Guarded so a malformed response can't divide by zero.
   double get aspectRatio =>

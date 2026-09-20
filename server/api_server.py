@@ -18,12 +18,11 @@ import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy.ndimage import binary_dilation
 from sentinelhub import (
     BBox,
     CRS,
-    DataCollection,
     Geometry,
     MimeType,
     SHConfig,
@@ -38,8 +37,11 @@ from bimonthly_composite import (
     fetch_true_color_base,
     month_range,
     run_composite_pipeline,
+    s2_collection,
+    sh_endpoints,
 )
 from cache import cache_get, cache_get_containing, cache_put
+from inference.change_clusters import ellipse_polygon, fit_change_clusters
 from inference.inference import ensemble_predict, expand_class, get_mask
 
 
@@ -67,13 +69,24 @@ LAND_COVER_COLORS: dict[str, tuple[int, int, int]] = {
     "Crop": (156, 204, 101),
     "Water": (21, 101, 192),
     "Soil": (161, 136, 127),
+    # Built-up, in the conventional cartographic red for built surfaces.
+    #
+    # Deliberately very dark. A mid red (the first attempt, #B71C1C) disappears
+    # into the imagery over a city: rooftops, brick kilns and dry ground are all
+    # reddish-brown at 10 m, so the class blended into the ground it was meant to
+    # mark. Nothing natural in these scenes is this dark and this saturated, so
+    # it reads as an annotation rather than as terrain.
+    "Building": (109, 0, 10),
 }
 
-# `expand_class` splits Sentinel-2's "Bare Soil" scene class in two: Building
-# where NDBI > 0, Soil otherwise. Land-use classification doesn't call out
-# built-up surfaces, so the split is folded back together here. Change detection
-# still relies on both labels — see `get_mask` in inference/inference.py.
-LAND_COVER_MERGE: dict[str, str] = {"Building": "Soil"}
+# `expand_class` splits Sentinel-2's "Bare Soil" scene class in two, which it
+# has to: SCL class 5 covers bare ground and built-up surfaces alike. That split
+# used to be the threshold `NDBI > 0` and the result was folded straight back
+# into Soil here, because a rule that scores worse than chance (MCC -0.283
+# against ground truth) is not worth showing anyone. It is now a trained model —
+# see inference/soil_building.py — so Building is reported as its own class and
+# nothing is merged away.
+LAND_COVER_MERGE: dict[str, str] = {}
 
 # Bands `ensemble_predict` needs; a NaN in any of them means the composite had
 # no cloud-free observation for that pixel, so it is left transparent.
@@ -108,9 +121,10 @@ STRETCH_SAMPLE_LIMIT = 400_000
 # Change-mask overlay colours, matching `_deforestColor` / `_waterColor` in
 # mobile/lib/screens/analysis/analysis_run_screen.dart. Keyed by the `mask`
 # value `get_mask` emits.
-CHANGE_COLORS: dict[int, tuple[int, int, int]] = {
-    1: (229, 57, 53),   # forest / vegetation loss  #E53935
-    2: (251, 140, 0),   # surface-water loss        #FB8C00
+CHANGE_COLORS: dict[str, tuple[int, int, int]] = {
+    "deforestation": (229, 57, 53),   # forest loss            #E53935
+    "water_loss": (251, 140, 0),      # surface-water loss     #FB8C00
+    "urbanization": (142, 36, 170),   # new built-up           #8E24AA
 }
 
 # ── Before/after land-cover class map ─────────────────────────────────────
@@ -119,19 +133,20 @@ CHANGE_COLORS: dict[int, tuple[int, int, int]] = {
 # a picture: every cell of each date painted by what it is, so the two dates can
 # be read as land cover rather than as raw reflectance.
 #
-# The five classifier labels fold into the three ground types the product
-# actually reasons about. `Crop` joins `Tree` (both vegetation) and `Building`
-# joins `Soil`, matching LAND_COVER_MERGE's precedent. Code 0 means the
-# composite had no cloud-free observation there.
+# The five classifier labels fold into the four ground types the product
+# actually reasons about: `Crop` joins `Tree` (both vegetation), while
+# `Building` now stands on its own — it is a model output rather than a
+# threshold guess, so it is worth a colour. Code 0 means the composite had no
+# cloud-free observation there.
 CLASS_MAP_CODES: dict[str, int] = {
     "Tree": 1,
     "Crop": 1,
     "Water": 2,
     "Soil": 3,
-    "Building": 3,
+    "Building": 4,
 }
 
-CLASS_MAP_NAMES: dict[int, str] = {1: "Tree", 2: "Water", 3: "Soil"}
+CLASS_MAP_NAMES: dict[int, str] = {1: "Tree", 2: "Water", 3: "Soil", 4: "Building"}
 
 # Per-class dark -> mid -> light ramps. A flat fill per class throws away every
 # bit of texture the sensor recorded and reads as three paper cut-outs, so hue
@@ -143,6 +158,13 @@ CLASS_MAP_RAMPS: dict[int, tuple[tuple[int, int, int], ...]] = {
     1: ((10, 58, 32), (45, 125, 50), (156, 214, 160)),    # Tree  — deep canopy -> new leaf
     2: ((7, 44, 80), (21, 101, 192), (147, 202, 249)),    # Water — deep -> shallow
     3: ((92, 62, 43), (176, 137, 104), (233, 214, 186)),  # Soil  — wet earth -> dry sand
+    # Building — shadowed -> sunlit roof. The light stop stays a deep, saturated
+    # red rather than climbing toward a pale rose: built-up is mostly *bright*,
+    # so nearly every Building cell lands near the top of its ramp, and a light
+    # stop like (196, 74, 84) — high green and blue, therefore desaturated —
+    # made the whole class look washed out and semi-transparent. Green and blue
+    # stay low all the way up, which is what keeps it reading as red.
+    4: ((40, 0, 4), (109, 0, 10), (168, 12, 22)),
 }
 
 # Brightness is stretched per class before it indexes the ramp. Raw reflectance
@@ -174,6 +196,11 @@ CLASS_MAP_PNG_COMPRESS_LEVEL = 3
 # pixels purely so it can be seen; the reported counts are never dilated.
 CHANGE_DILATION_DIVISOR = 500
 
+# Outline thickness for a change region's ellipse, in pixels of the rendered
+# raster. The fill is translucent so the ground stays readable; the outline is
+# what actually marks the boundary.
+CHANGE_ELLIPSE_STROKE = 3
+
 # Used only when the true-colour fetch fails and there is no base image whose
 # shape the mask can borrow.
 CHANGE_RASTER_PX = 768
@@ -190,8 +217,32 @@ CHANGE_RASTER_PX = 768
 # loss detection in favour of directional previous-minus-current class presence.
 # v7 requires two clear observations per date and uses adaptive full-month
 # composites, so v6 results do not carry the reliability information now needed.
+# v8 retires v7, which labelled every built-up pixel `Soil`: the soil/building
+# split is a trained model now and Building is its own class, so a v7 entry
+# would serve a class map and legend missing a class that exists.
 # Bump again whenever the response shape, rendering, or detection semantics change.
-ANALYZE_CACHE_KIND = "analyze_v7"
+# v9 adds the urbanisation layer and per-phenomenon counts; a v8 entry has no
+# urbanisation raster at all, so the service that asks for it would show nothing.
+# v10 replaces the per-pixel change rasters with clustered region ellipses and
+# adds `changeRegions`; a v9 raster is a scatter of cells and cannot be turned
+# into regions after the fact, because the cells themselves are not stored.
+# v11 retires v10's Building colour. The class-map PNGs and the legend hexes are
+# baked into the stored payload, so a cached entry keeps serving whatever colour
+# was current when it was written however many times the constant is edited.
+# v12 deepens the Building ramp; the class-map PNG is painted before it is
+# stored, so a v11 entry keeps serving the washed-out red.
+ANALYZE_CACHE_KIND = "analyze_v12"
+
+# Same reasoning for the land-use endpoint. It was an unversioned "classify"
+# until Building became a reported class; those entries encode label grids
+# against the old 5-entry code table and know nothing about code 5.
+#
+# v3 retires v2's colours. The `classes` list in a cached payload carries each
+# class's hex, and the overlay PNG is already painted, so editing
+# LAND_COVER_COLORS changes nothing for an area that has been classified before
+# — the legend keeps showing the old swatch. **Bump this whenever a colour
+# changes**, not only when the response shape does.
+CLASSIFY_CACHE_KIND = "classify_v3"
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -206,7 +257,13 @@ TARGET_R20M_DIR = (
 
 
 def build_config() -> SHConfig:
-    """Load Sentinel Hub credentials from environment or local SH config."""
+    """Load Sentinel Hub credentials from environment or local SH config.
+
+    The deployment follows the credential: a Copernicus Data Space client id
+    ("sh-" prefixed) authenticates against CDSE, anything else against the legacy
+    Sentinel Hub. Getting this wrong fails at the token exchange with
+    `invalid_client`, which looks like a bad secret and is not.
+    """
     cfg = SHConfig()
     has_id = bool(cfg.sh_client_id)
     has_secret = bool(cfg.sh_client_secret)
@@ -216,6 +273,8 @@ def build_config() -> SHConfig:
             "Sentinel Hub credentials are missing. Configure SH_CLIENT_ID and SH_CLIENT_SECRET "
             "or set credentials in Sentinel Hub config."
         )
+    cfg.sh_base_url, cfg.sh_token_url = sh_endpoints(cfg.sh_client_id)
+    logger.info("Sentinel Hub deployment: %s", cfg.sh_base_url)
     return cfg
 
 
@@ -287,7 +346,7 @@ def build_scl_request(
         evalscript=scl_evalscript(),
         input_data=[
             SentinelHubRequest.input_data(
-                data_collection=DataCollection.SENTINEL2_L2A,
+                data_collection=s2_collection(cfg.sh_base_url),
                 time_interval=(start_dt, end_dt),
                 mosaicking_order="leastCC",
             )
@@ -772,12 +831,17 @@ def analyze_change():
             & merged["ClearObservationCount_curr"].fillna(0).ge(MIN_CLEAR_OBSERVATIONS)
         )
         changed = mask_df[(mask_df["mask"] != 0) & reliable.to_numpy()]
+        # Kept as its own frame: `changes` below must stay a plain lon/lat/mask
+        # list, while the rasters need the per-phenomenon booleans.
         eligible_pixels = int(reliable.sum())
         uncertain_pixels = int(len(merged) - eligible_pixels)
-        logger.info("[%s] Reliable pixels: %d/%d; changed: %d (mask=1: %d, mask=2: %d)",
-                     request_id, eligible_pixels, len(merged), len(changed),
-                     int((changed["mask"] == 1).sum()),
-                     int((changed["mask"] == 2).sum()))
+        logger.info(
+            "[%s] Reliable pixels: %d/%d; changed: %d "
+            "(deforestation %d, water loss %d, urbanisation %d)",
+            request_id, eligible_pixels, len(merged), len(changed),
+            int(changed["deforestation"].sum()),
+            int(changed["water_loss"].sum()),
+            int(changed["urbanization"].sum()))
 
         changes = changed[["Longitude", "Latitude", "mask"]].to_dict(orient="records")
 
@@ -837,11 +901,32 @@ def analyze_change():
             logger.warning("[%s] class maps unavailable (%s)", request_id, exc)
             old_class_b64 = new_class_b64 = None
 
+        # Group each phenomenon's changed cells into regions before drawing
+        # anything. What gets reported is a place with a centre, not a scatter
+        # of specks — see inference/change_clusters.py for why the number of
+        # regions is chosen rather than fixed.
+        clusters: dict[str, list[dict]] = {}
+        for kind in ("deforestation", "water_loss", "urbanization"):
+            hits = changed[changed[kind].to_numpy()]
+            logger.info("[%s] %s: %d cell(s)", request_id, kind, len(hits))
+            clusters[kind] = fit_change_clusters(
+                hits["Longitude"].to_numpy(), hits["Latitude"].to_numpy(),
+            )
+
         deforestation_png_b64 = _encode_png(
-            _render_change_overlay(changed, 1, west, south, east, north, base_h, base_w), 1,
+            _render_change_overlay(
+                clusters["deforestation"], "deforestation",
+                west, south, east, north, base_h, base_w), 1,
         )
         water_loss_png_b64 = _encode_png(
-            _render_change_overlay(changed, 2, west, south, east, north, base_h, base_w), 1,
+            _render_change_overlay(
+                clusters["water_loss"], "water_loss",
+                west, south, east, north, base_h, base_w), 1,
+        )
+        urbanization_png_b64 = _encode_png(
+            _render_change_overlay(
+                clusters["urbanization"], "urbanization",
+                west, south, east, north, base_h, base_w), 1,
         )
 
         result = {
@@ -854,6 +939,15 @@ def analyze_change():
             "newClassPngBase64": new_class_b64,
             "deforestationPngBase64": deforestation_png_b64,
             "waterLossPngBase64": water_loss_png_b64,
+            "urbanizationPngBase64": urbanization_png_b64,
+            # Where each change happened, as named regions rather than a pixel
+            # dump: centre in degrees, the ellipse that describes the spread,
+            # and how many cells it covers.
+            "changeRegions": {
+                "deforestation": clusters["deforestation"],
+                "waterLoss": clusters["water_loss"],
+                "urbanization": clusters["urbanization"],
+            },
             "imageWidth": base_w,
             "imageHeight": base_h,
             "bounds": {"north": north, "south": south, "east": east, "west": west},
@@ -866,8 +960,9 @@ def analyze_change():
                 "eligiblePixels": eligible_pixels,
                 "uncertainPixels": uncertain_pixels,
                 "minimumClearObservations": MIN_CLEAR_OBSERVATIONS,
-                "deforestation": int((changed["mask"] == 1).sum()),
-                "waterLoss": int((changed["mask"] == 2).sum()),
+                "deforestation": int(changed["deforestation"].sum()),
+                "waterLoss": int(changed["water_loss"].sum()),
+                "urbanization": int(changed["urbanization"].sum()),
                 "oldDate": f"{old_year}-{old_month:02d}",
                 "newDate": f"{new_year}-{new_month:02d}",
                 "oldWindow": _window_label(*old_window),
@@ -1087,8 +1182,8 @@ def _change_raster_shape(west: float, south: float, east: float, north: float) -
 
 
 def _render_change_overlay(
-    changed: pd.DataFrame,
-    mask_value: int,
+    clusters: list[dict],
+    kind: str,
     west: float,
     south: float,
     east: float,
@@ -1098,37 +1193,41 @@ def _render_change_overlay(
 ) -> Image.Image:
     """Paint one change class into an RGBA raster spanning the AOI bounding box.
 
-    Each class gets its own raster so the client can toggle them independently —
-    isolating deforestation is the common case. Sparse transparent PNGs compress
-    to almost nothing, so two rasters cost far less than the imagery does.
+    Draws the *regions* the change forms, not the individual cells. A map of
+    several thousand 30 m specks tells you change happened somewhere; an ellipse
+    per region tells you where, and has a centre that can go in a table.
 
-    A pixel's lon/lat maps linearly into the box, which is how the client
-    stretches the imagery too, so mask and scene stay aligned. Hits are dilated
-    for visibility only — see CHANGE_DILATION_DIVISOR.
+    `kind` picks the colour and names the phenomenon. Each class gets its own
+    raster so the client can show exactly the one the chosen service is about.
+
+    A cluster's lon/lat maps linearly into the box, which is how the client
+    stretches the imagery too, so the regions and the scene stay aligned.
     """
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    if len(changed) == 0 or width < 1 or height < 1:
-        return Image.fromarray(rgba, mode="RGBA")
-
-    selected = changed[changed["mask"] == mask_value]
-    if len(selected) == 0:
-        return Image.fromarray(rgba, mode="RGBA")
+    image = Image.fromarray(rgba, mode="RGBA")
+    if not clusters or width < 1 or height < 1:
+        return image
 
     lon_span = (east - west) or 1e-9
     lat_span = (north - south) or 1e-9
-    lon = selected["Longitude"].to_numpy(dtype=np.float64)
-    lat = selected["Latitude"].to_numpy(dtype=np.float64)
+    red, green, blue = CHANGE_COLORS[kind]
+    draw = ImageDraw.Draw(image, "RGBA")
 
-    cols = np.clip(((lon - west) / lon_span * width).astype(int), 0, width - 1)
-    rows = np.clip(((north - lat) / lat_span * height).astype(int), 0, height - 1)
+    for cluster in clusters:
+        ring = ellipse_polygon(cluster)
+        xy = [
+            (
+                float((lon - west) / lon_span * width),
+                float((north - lat) / lat_span * height),
+            )
+            for lon, lat in ring
+        ]
+        # Translucent fill so the scene stays readable underneath, with a solid
+        # edge so the region's extent is unambiguous.
+        draw.polygon(xy, fill=(red, green, blue, 70), outline=(red, green, blue, 255))
+        draw.line(xy + [xy[0]], fill=(red, green, blue, 255), width=CHANGE_ELLIPSE_STROKE)
 
-    hit = np.zeros((height, width), dtype=bool)
-    hit[rows, cols] = True
-    hit = binary_dilation(
-        hit, iterations=max(1, max(height, width) // CHANGE_DILATION_DIVISOR),
-    )
-    rgba[hit] = (*CHANGE_COLORS[mask_value], 255)
-    return Image.fromarray(rgba, mode="RGBA")
+    return image
 
 
 def _class_code_grid(
@@ -1445,7 +1544,7 @@ def _render_base_true_color(rgb: np.ndarray, valid: np.ndarray) -> Image.Image:
 # is served by cropping the cached result — no Sentinel Hub fetch. The land-cover
 # label grid is stored (as compact int codes) alongside the response so the
 # overlay can be re-rendered and class stats recomputed exactly for the sub-area.
-_CODE_TO_LABEL = ["", "Tree", "Crop", "Water", "Soil"]
+_CODE_TO_LABEL = ["", "Tree", "Crop", "Water", "Soil", "Building"]
 _LABEL_TO_CODE = {name: i for i, name in enumerate(_CODE_TO_LABEL)}
 
 
@@ -1595,8 +1694,13 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
         c for c in payload.get("changes", [])
         if rw <= c["Longitude"] <= re_ and rs <= c["Latitude"] <= rn
     ]
+    # The point list carries only the summary code, so a pixel that was both
+    # cleared and built on counts once, under the loss. The full-run response
+    # counts the booleans and can report both; a cropped subset cannot, and
+    # under-reporting urbanisation is better than inventing it.
     deforestation = sum(1 for c in changes if c.get("mask") == 1)
     water_loss = sum(1 for c in changes if c.get("mask") == 2)
+    urbanization = sum(1 for c in changes if c.get("mask") == 3)
 
     full_stats = payload.get("stats", {})
     full_total = int(full_stats.get("totalPixels", 0))
@@ -1614,6 +1718,7 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
         stats["uncertainPixels"] = sub_total - stats["eligiblePixels"]
     stats["deforestation"] = deforestation
     stats["waterLoss"] = water_loss
+    stats["urbanization"] = urbanization
 
     # The stored rasters span the whole cached area, so crop all three to the
     # sub-box. They share bounds and shape, so one set of dimensions covers them.
@@ -1626,6 +1731,26 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
     water_loss_png, _, _ = _crop_png_b64(
         payload.get("waterLossPngBase64"), cached_bounds, req_bbox,
     )
+    urbanization_png, _, _ = _crop_png_b64(
+        payload.get("urbanizationPngBase64"), cached_bounds, req_bbox,
+    )
+
+    # Regions are kept when their centre lands in the sub-box. A region
+    # straddling the edge keeps its full ellipse, which is honest: it describes
+    # change that really does extend past what was asked for, and clipping the
+    # geometry would report a smaller area than was found.
+    def _regions_within(entries):
+        return [
+            r for r in (entries or [])
+            if rw <= r.get("centerLon", 0.0) <= re_
+            and rs <= r.get("centerLat", 0.0) <= rn
+        ]
+
+    full_regions = payload.get("changeRegions") or {}
+    change_regions = {
+        key: _regions_within(full_regions.get(key))
+        for key in ("deforestation", "waterLoss", "urbanization")
+    }
     # The class maps span the same bounds and shape as the scenes, so the same
     # crop lands on the same ground.
     old_class_png, _, _ = _crop_png_b64(
@@ -1647,6 +1772,8 @@ def _crop_analyze(contained: dict, req_bbox: tuple) -> dict:
         "newClassPngBase64": new_class_png,
         "deforestationPngBase64": deforestation_png,
         "waterLossPngBase64": water_loss_png,
+        "urbanizationPngBase64": urbanization_png,
+        "changeRegions": change_regions,
         "imageWidth": sub_w,
         "imageHeight": sub_h,
         "bounds": {"north": rn, "south": rs, "east": re_, "west": rw},
@@ -1694,13 +1821,13 @@ def classify_land_use():
         date_key = f"{year}-{month:02d}"
         is_current = (year, month) == (now.year, now.month)
 
-        cached = cache_get("classify", date_key, bbox_bounds, is_current)
+        cached = cache_get(CLASSIFY_CACHE_KIND, date_key, bbox_bounds, is_current)
         if cached is not None:
             logger.info("[%s] served land-use classification from cache", request_id)
             return jsonify(cached)
 
         # Phase 2: a smaller area fully inside a computed one is cropped from it.
-        contained = cache_get_containing("classify", date_key, bbox_bounds, is_current)
+        contained = cache_get_containing(CLASSIFY_CACHE_KIND, date_key, bbox_bounds, is_current)
         if contained is not None and contained.get("extras"):
             try:
                 sub_result = _crop_classify(contained, bbox_bounds)
@@ -1710,11 +1837,18 @@ def classify_land_use():
                 logger.warning("[%s] subset crop failed (%s); computing fresh", request_id, exc)
 
         cfg = build_config()
-        # whole_month=True: composite every pass in the month so the cloud-masked
-        # median has enough clear looks to actually remove clouds (planet.py method).
+        # Same compositing rule as change detection: a 60-day window centred on
+        # the requested month, widened to 90 only where pixels still lack
+        # MIN_CLEAR_OBSERVATIONS clear looks. This used to take the calendar
+        # month exactly and never widen, so a cloudy or sparsely-imaged month
+        # produced a composite built from one or two passes — and the land-use
+        # map and the change maps were built from different amounts of imagery
+        # for the same month, which made them disagree for no good reason.
         df = run_composite_pipeline(
             polygon, year, month, cfg.sh_client_id, cfg.sh_client_secret,
             whole_month=True,
+            min_clear_observations=MIN_CLEAR_OBSERVATIONS,
+            max_window_days=MAX_ADAPTIVE_WINDOW_DAYS,
         )
 
         rows10, cols10 = _grid_shape(df)
@@ -1820,7 +1954,7 @@ def classify_land_use():
             # the table drifting out of sync).
             "codeToLabel": _CODE_TO_LABEL,
         }
-        cache_put("classify", date_key, bbox_bounds, is_current, result, extras=extras)
+        cache_put(CLASSIFY_CACHE_KIND, date_key, bbox_bounds, is_current, result, extras=extras)
         return jsonify(result)
 
     except ValueError as exc:

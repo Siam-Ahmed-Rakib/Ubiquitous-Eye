@@ -60,6 +60,7 @@ void main() {
         totalPixels: 30000,
         deforestation: withChanges ? kDeforestationCount : 0,
         waterLoss: withChanges ? kWaterLossCount : 0,
+        urbanization: 0,
         oldDate: '2024-01',
         newDate: '2025-08',
         oldWindow: '1–15 Jan 2024',

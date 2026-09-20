@@ -1,0 +1,228 @@
+{
+  "model_version": "soil_building_v1",
+  "trained_at": "2026-09-17 09:57:12",
+  "purpose": "binary soil-vs-building sub-classifier for ClassID == 5 pixels; replaces the 'NDBI > 0.0' rule in expand_class",
+  "replaces": "server/inference/inference.py expand_class, soil branch",
+  "xgboost_version": "3.2.0",
+  "sklearn_version": "1.6.1",
+  "joblib_version": "1.5.3",
+  "device": "cuda",
+  "task": "binary",
+  "target": "soilClassifiedId",
+  "class_id_filter": {
+    "column": "ClassID",
+    "value": 5
+  },
+  "idx_to_class": {
+    "0": 0,
+    "1": 1
+  },
+  "class_names": {
+    "0": "Building",
+    "1": "Soil"
+  },
+  "positive_class": {
+    "index": 1,
+    "raw": 1,
+    "name": "Soil"
+  },
+  "threshold": 0.375,
+  "features": [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B08",
+    "B11",
+    "B12",
+    "NDVI",
+    "EVI",
+    "NDBI",
+    "MNDWI",
+    "NDWI",
+    "SAVI",
+    "BSI_N",
+    "BI",
+    "AWEI",
+    "UI",
+    "IBI",
+    "R_B11_B12"
+  ],
+  "n_features": 19,
+  "source_bands": [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B08",
+    "B11",
+    "B12"
+  ],
+  "index_formulas": {
+    "NDVI": "(B08 - B04) / (B08 + B04)",
+    "EVI": "2.5 * (B08 - B04) / (B08 + 6*B04 - 7.5*B02 + 1)",
+    "NDBI": "(B11 - B08) / (B11 + B08)",
+    "MNDWI": "(B03 - B11) / (B03 + B11)",
+    "NDWI": "(B03 - B08) / (B03 + B08)",
+    "SAVI": "1.5 * (B08 - B04) / (B08 + B04 + 0.5)",
+    "BSI_N": "((B11 + B04) - (B08 + B02)) / ((B11 + B04) + (B08 + B02))",
+    "BI": "sqrt((B04**2 + B03**2) / 2)",
+    "AWEI": "4*(B03 - B11) - (0.25*B08 + 2.75*B12)",
+    "UI": "(B12 - B08) / (B12 + B08)",
+    "IBI": "(NDBI - (SAVI + MNDWI)/2) / (NDBI + (SAVI + MNDWI)/2)   [clipped]",
+    "R_B11_B12": "B11 / B12   [clipped]"
+  },
+  "clip_bounds": {
+    "IBI": [
+      -10.0,
+      10.0
+    ],
+    "R_B11_B12": [
+      0.0,
+      10.0
+    ]
+  },
+  "band_scale": "reflectance 0..1 (Sentinel Hub DN / 10000, as EVALSCRIPT_S2 returns)",
+  "excluded_columns": [
+    "Longitude",
+    "Latitude",
+    "ClassID",
+    "ClassName"
+  ],
+  "excluded_bands": [
+    "B05",
+    "B06",
+    "B07",
+    "B8A",
+    "B09"
+  ],
+  "excluded_reason": "not downloaded by EVALSCRIPT_S2; the pipeline cannot compute them",
+  "uses_scaler": true,
+  "split_strategy": "spatial_block",
+  "block_size_m": 1000.0,
+  "split_sizes": {
+    "train": 1783823,
+    "val": 408160,
+    "test": 438373
+  },
+  "params": {
+    "max_depth": 6,
+    "eta": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 1,
+    "gamma": 0.0,
+    "lambda": 1.0,
+    "alpha": 0.0,
+    "seed": 42,
+    "tree_method": "hist",
+    "device": "cuda",
+    "objective": "binary:logistic",
+    "scale_pos_weight": 0.832691724842937,
+    "eval_metric": [
+      "logloss",
+      "auc",
+      "aucpr"
+    ]
+  },
+  "num_boost_round": 5000,
+  "early_stop_rounds": 100,
+  "early_stop_metric": "aucpr",
+  "best_iteration": 1781,
+  "best_val_aucpr": 0.994261,
+  "metrics": [
+    {
+      "split": "train",
+      "n": 1783823,
+      "accuracy": 0.982,
+      "precision": 0.9815,
+      "recall": 0.9856,
+      "f1": 0.9836,
+      "mcc": 0.9637,
+      "roc_auc": 0.9985,
+      "pr_auc": 0.9988
+    },
+    {
+      "split": "val",
+      "n": 408160,
+      "accuracy": 0.9695,
+      "precision": 0.9702,
+      "recall": 0.9596,
+      "f1": 0.9648,
+      "mcc": 0.9379,
+      "roc_auc": 0.9951,
+      "pr_auc": 0.9943
+    },
+    {
+      "split": "test",
+      "n": 438373,
+      "accuracy": 0.9722,
+      "precision": 0.9496,
+      "recall": 0.983,
+      "f1": 0.966,
+      "mcc": 0.9429,
+      "roc_auc": 0.9961,
+      "pr_auc": 0.995
+    }
+  ],
+  "baseline_comparison": [
+    {
+      "model": "NDBI > 0 rule (current pipeline)",
+      "accuracy": 0.4835,
+      "precision": 0.0287,
+      "recall": 0.0087,
+      "f1": 0.0133,
+      "mcc": -0.283
+    },
+    {
+      "model": "soil_building_v1 (this notebook)",
+      "accuracy": 0.9722,
+      "precision": 0.9496,
+      "recall": 0.983,
+      "f1": 0.966,
+      "mcc": 0.9429
+    }
+  ],
+  "top_features": [
+    {
+      "feature": "AWEI",
+      "gain_pct": 55.39
+    },
+    {
+      "feature": "B11",
+      "gain_pct": 16.13
+    },
+    {
+      "feature": "BSI_N",
+      "gain_pct": 4.32
+    },
+    {
+      "feature": "B01",
+      "gain_pct": 4.22
+    },
+    {
+      "feature": "B12",
+      "gain_pct": 4.21
+    },
+    {
+      "feature": "B03",
+      "gain_pct": 2.89
+    },
+    {
+      "feature": "B02",
+      "gain_pct": 2.78
+    },
+    {
+      "feature": "R_B11_B12",
+      "gain_pct": 1.51
+    },
+    {
+      "feature": "IBI",
+      "gain_pct": 1.23
+    },
+    {
+      "feature": "BI",
+      "gain_pct": 1.13
+    }
+  ]
+}

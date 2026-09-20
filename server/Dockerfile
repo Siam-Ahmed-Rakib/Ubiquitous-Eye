@@ -18,7 +18,17 @@ COPY mobile/ ./
 # hostname here would pin the image to one deployment URL. Set it only to point
 # the UI at a backend somewhere other than the one serving it.
 ARG BACKEND_URL=
-RUN flutter build web --release --dart-define=BACKEND_URL=${BACKEND_URL}
+# --pwa-strategy=none: do not register a service worker.
+#
+# Flutter's default PWA service worker caches main.dart.js and serves it from
+# that cache on later loads, ignoring the `Cache-Control: no-cache` the backend
+# sends. The effect is a UI that is half-updated after a redeploy: anything
+# fetched from the API is current, while anything compiled into the bundle —
+# colours, labels, layout — is whatever it was at the last cache fill. That is
+# far more confusing than a slightly slower first paint, and this app is served
+# from the same container as its API, so it has no offline story to protect.
+RUN flutter build web --release --pwa-strategy=none \
+    --dart-define=BACKEND_URL=${BACKEND_URL}
 
 FROM python:3.12-slim@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc AS runtime
 
@@ -56,4 +66,15 @@ EXPOSE 5000
 # numpy/sklearn/xgboost/catboost is shared copy-on-write instead of paid per
 # worker. This is only safe because cache.py builds its SQLAlchemy engine lazily,
 # after the fork -- preloading an open connection pool corrupts shared sockets.
-CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT} --workers ${WEB_CONCURRENCY:-2} --threads 4 --timeout 300 --preload api_server:app"]
+#
+# --timeout is how long gunicorn lets a worker hold a request before killing it.
+# A classify/analyze run is a catalogue search, a download of every clear
+# acquisition in the window, a temporal median composite and then inference over
+# every cell; a large area, or one whose adaptive compositor widens its window
+# hunting for clear looks, takes far longer than the old 300 s. A killed worker
+# surfaces to the browser as a connection error, so it reads like the server is
+# down when it is really still working.
+#
+# Keep this >= kBackendRequestTimeout in mobile/lib/config.dart. The client must
+# never outwait the server.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT} --workers ${WEB_CONCURRENCY:-2} --threads 4 --timeout ${GUNICORN_TIMEOUT:-1800} --graceful-timeout 30 --preload api_server:app"]

@@ -70,7 +70,7 @@ class AnalysisService {
               'newMonth': newMonth,
             }),
           )
-          .timeout(const Duration(minutes: 5));
+          .timeout(kBackendRequestTimeout);
     } catch (e) {
       throw AnalysisException(
         'Could not reach the backend at $_baseUrl.\n'
@@ -126,6 +126,13 @@ class AnalysisService {
       oldClasses: _parseClasses(breakdown, 'old'),
       newClasses: _parseClasses(breakdown, 'new'),
       deforestationPng: _decodePng(body['deforestationPngBase64']),
+      urbanizationPng: _decodePng(body['urbanizationPngBase64']),
+      deforestationRegions:
+          ChangeRegion.listFrom((body['changeRegions'] ?? {})['deforestation']),
+      waterLossRegions:
+          ChangeRegion.listFrom((body['changeRegions'] ?? {})['waterLoss']),
+      urbanizationRegions:
+          ChangeRegion.listFrom((body['changeRegions'] ?? {})['urbanization']),
       waterLossPng: _decodePng(body['waterLossPngBase64']),
       imageWidth: (body['imageWidth'] as num?)?.toInt() ?? 0,
       imageHeight: (body['imageHeight'] as num?)?.toInt() ?? 0,
@@ -250,6 +257,7 @@ AnalysisResult sampleAnalysis({
 
   final deforestation = changes.where((c) => c.isDeforestation).length;
   final waterLoss = changes.where((c) => c.isWaterLoss).length;
+  final urbanization = changes.where((c) => c.isUrbanization).length;
 
   return AnalysisResult(
     message: 'Sample result — illustrative data, not a real satellite analysis.',
@@ -260,6 +268,7 @@ AnalysisResult sampleAnalysis({
       totalPixels: (_sampleGridCells + 1) * (_sampleGridCells + 1),
       deforestation: deforestation,
       waterLoss: waterLoss,
+      urbanization: urbanization,
       oldDate: '$oldYear-${oldMonth.toString().padLeft(2, '0')}',
       newDate: '$newYear-${newMonth.toString().padLeft(2, '0')}',
     ),

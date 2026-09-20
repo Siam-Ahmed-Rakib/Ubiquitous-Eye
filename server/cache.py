@@ -93,7 +93,7 @@ _POINT_CHUNK_PG = 1000
 # Mirrors ``_CODE_TO_LABEL`` in api_server.py, used to decode the stored label
 # grid. New writes carry their own copy in ``extras["codeToLabel"]`` and that is
 # preferred; this fallback only serves entries cached before that was added.
-_FALLBACK_CODE_TO_LABEL = ["", "Tree", "Crop", "Water", "Soil"]
+_FALLBACK_CODE_TO_LABEL = ["", "Tree", "Crop", "Water", "Soil", "Building"]
 
 # Longest cache_key we can produce: analysis (<=16) + date_key (<=16) + four
 # 3-decimal coordinates, plus separators. ~60 chars in practice; 160 is headroom
@@ -235,7 +235,7 @@ def _create_table_sql(pg: bool) -> str:
 def _create_lookup_table_sql(pg: bool) -> str:
     """DDL for the land-cover vocabulary.
 
-    Four rows for the life of the project (Tree/Crop/Water/Soil). The display
+    Five rows for the life of the project (Tree/Crop/Water/Soil/Building). The display
     colour belongs here and nowhere else: it is a constant of the class, so
     holding it on every result row would repeat the same seven characters
     thousands of times. Rows referencing a class carry a SMALLINT id instead,
