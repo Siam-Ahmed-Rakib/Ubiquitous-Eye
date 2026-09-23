@@ -61,6 +61,22 @@ _BBOX_QUANT = 3
 # past months never change, so they are served from cache indefinitely.
 CURRENT_PERIOD_TTL_DAYS = 5
 
+# The cache is size-bounded, oldest out. Supabase's free plan caps the whole
+# database at 500 MB and switches it to read-only at the cap, after which no
+# result can be cached at all -- every run goes cold and stays cold. So once the
+# saved responses pass this budget, the oldest are deleted to make room for new
+# ones. This replaces an earlier never-delete rule; the user chose it on
+# 2026-09-23. Override with CACHE_MAX_MB.
+#
+# The budget is on the rows' *stored* size (pg_column_size, i.e. after TOAST
+# compression), not on pg_database_size. Postgres does not give a deleted row's
+# space back to the operating system, only marks it reusable, so the database
+# size never drops after an eviction; a trigger on it would keep firing until
+# the table was empty. 300 MB of rows puts the whole database near 365 MB,
+# leaving room for the per-location map (classification_point, never evicted),
+# the indexes, and freed space autovacuum has not recycled yet.
+_CACHE_MAX_MB_DEFAULT = 300.0
+
 _TABLE = "analysis_cache"
 
 # Per-class rows lifted out of a classify payload, one per land-cover class.
@@ -342,6 +358,11 @@ def _index_sqls() -> list[str]:
         f"ON {_POINT_TABLE} (class_id)",
         f"CREATE INDEX IF NOT EXISTS idx_{_POINT_TABLE}_observed "
         f"ON {_POINT_TABLE} (observed_on)",
+        # classification_point.cache_id is ON DELETE SET NULL, so every evicted
+        # response makes Postgres look for map points that reference it. Without
+        # this, that is a full scan of the map per evicted row.
+        f"CREATE INDEX IF NOT EXISTS idx_{_POINT_TABLE}_cache "
+        f"ON {_POINT_TABLE} (cache_id)",
     ]
 
 
@@ -1066,6 +1087,94 @@ def _store_points(conn, cache_id, extras, bounds, observed_on) -> int:
     return len(params)
 
 
+def _cache_budget_bytes() -> int:
+    """The stored-size budget for cached responses, from CACHE_MAX_MB."""
+    raw = os.environ.get("CACHE_MAX_MB", "").strip()
+    if raw:
+        try:
+            mb = float(raw)
+        except ValueError:
+            mb = 0.0
+        if mb > 0:
+            return int(mb * 1_000_000)
+        logger.warning(
+            "Ignoring CACHE_MAX_MB=%r (not a positive number) — using %.0f MB",
+            raw, _CACHE_MAX_MB_DEFAULT,
+        )
+    return int(_CACHE_MAX_MB_DEFAULT * 1_000_000)
+
+
+def _row_size_sql() -> str:
+    """SQL for one cached row's size in bytes, as stored."""
+    if _pg_dialect:
+        # After TOAST compression -- what actually counts toward the cap.
+        return "(pg_column_size(payload) + COALESCE(pg_column_size(extras), 0))"
+    return "(length(CAST(payload AS BLOB)) + COALESCE(length(CAST(extras AS BLOB)), 0))"
+
+
+def _evict_oldest(engine, keep_key: str) -> tuple[int, int]:
+    """Delete the oldest cached responses until the rest fit the budget.
+
+    Returns ``(rows_deleted, bytes_freed)``. ``keep_key`` -- the entry just
+    written -- is never a victim, even when it alone exceeds the budget: eviction
+    exists to make room for new data, not to discard it.
+
+    A response's classification_result rows go with it. Its classification_point
+    rows do not (the FK is ON DELETE SET NULL): the map is ground truth and
+    outlives the response that produced it.
+    """
+    from sqlalchemy import bindparam, text
+
+    budget = _cache_budget_bytes()
+    size = _row_size_sql()
+    with engine.begin() as conn:
+        total = conn.execute(text(f"SELECT COALESCE(SUM({size}), 0) FROM {_TABLE}")).scalar()
+        total = int(total or 0)
+        if total <= budget:
+            return 0, 0
+
+        # Oldest first: created_at, with id breaking ties. Superseded formats
+        # (an old ANALYZE_CACHE_KIND) are always older than current ones, so
+        # they go before any result the app can still read.
+        candidates = conn.execute(
+            text(f"SELECT id, {size} FROM {_TABLE} WHERE cache_key <> :k ORDER BY created_at, id"),
+            {"k": keep_key},
+        ).fetchall()
+        victims, freed = [], 0
+        for row_id, nbytes in candidates:
+            if total - freed <= budget:
+                break
+            victims.append(row_id)
+            freed += int(nbytes or 0)
+        if not victims:
+            return 0, 0
+
+        # Children first, explicitly -- same reason as in cache_put: SQLite only
+        # enforces foreign keys when a per-connection pragma is on.
+        for table, column in ((_CLASS_TABLE, "cache_id"), (_TABLE, "id")):
+            conn.execute(
+                text(f"DELETE FROM {table} WHERE {column} IN :ids").bindparams(
+                    bindparam("ids", expanding=True)
+                ),
+                {"ids": victims},
+            )
+    return len(victims), freed
+
+
+def _enforce_budget(engine, keep_key: str) -> None:
+    """Best-effort eviction after a write. Never raises."""
+    try:
+        evicted, freed = _evict_oldest(engine, keep_key)
+    except Exception as exc:  # pragma: no cover - depends on external DB
+        logger.warning("Cache eviction failed (%s) — entry kept, cache may exceed budget", exc)
+        return
+    if evicted:
+        logger.info(
+            "Cache EVICT: %d oldest entr%s (%.1f MB) to stay under %.0f MB",
+            evicted, "y" if evicted == 1 else "ies", freed / 1e6, _cache_budget_bytes() / 1e6,
+        )
+
+
 def cache_put(
     analysis: str,
     date_key: str,
@@ -1151,6 +1260,11 @@ def cache_put(
         )
     except Exception as exc:  # pragma: no cover - depends on external DB
         logger.warning("Cache write failed (%s) — response still returned", exc)
+        return
+
+    # Its own transaction, after the write has committed, so an eviction that
+    # fails can never cost the response just stored.
+    _enforce_budget(engine, key)
 
 
 def cache_get_containing(analysis: str, date_key: str, req_bbox, is_current: bool):

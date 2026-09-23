@@ -1050,8 +1050,9 @@ Standing conventions, recorded so they don't get relitigated:
 - **The user pushes.** Commit freely; don't `git push` unless told to in that message.
 - **Ask before implementing anything ambiguous** — don't settle a design question with
   your own choice.
-- **Don't delete rows from `analysis_cache`.** 32 rows in superseded formats hold
-  ~64 MB. Leave them.
+- **`analysis_cache` is size-bounded, oldest out** (decided 2026-09-23). Past
+  `CACHE_MAX_MB` (default 300) the oldest results are evicted automatically; no
+  manual deletes.
 - **Never print secret values.**
 - Parallelising the Sentinel Hub fetch loops has been explicitly declined — "that
   fetching wait is acceptable". Don't re-propose it unprompted.

@@ -13,8 +13,11 @@ the current state, what is finished, what is not, and the exact next command.
 - **Never run `git push`.** Commit freely; the user pushes. This is explicit.
 - **Ask before implementing anything ambiguous.** Do not resolve a design question
   with your own choice — raise it.
-- **Never delete rows from `analysis_cache`.** Cleanup was offered three times and
-  declined. 32 rows in superseded formats hold ~64 MB; leave them.
+- **`analysis_cache` is size-bounded, oldest out.** The user's decision, 2026-09-23,
+  replacing the old never-delete rule. Once stored results pass `CACHE_MAX_MB`
+  (default 300) `cache_put` evicts the oldest to stay clear of Supabase's 500 MB
+  read-only cap. That automatic eviction is the only deletion path: do not delete
+  rows by hand. `classification_point` (the per-location map) is never evicted.
 - **Never print secrets.** `.env` (untracked) holds `SH_CLIENT_ID`,
   `SH_CLIENT_SECRET`, `DATABASE_URL`. Verify presence by length/hash, never value.
 
@@ -56,9 +59,10 @@ mangles `/app` into a Windows path and the exec fails with "Cwd must be absolute
   COPYs the lockfile and no longer runs `flutter create . --platforms web`, so if either
   is re-ignored the image builds fine for whoever has them locally and fails for everyone
   else. `deploy/azure-redeploy.sh` preflights for both.
-- **Bumping `ANALYZE_CACHE_KIND` silently orphans every cached analyze.** Rows are never
-  deleted (standing instruction), so the table keeps growing and every demo area goes
-  cold at once. Re-warm the areas in `DEMO.md` after any bump.
+- **Bumping `ANALYZE_CACHE_KIND` silently orphans every cached analyze.** Every demo
+  area goes cold at once; re-warm the areas in `DEMO.md` after any bump. The orphaned
+  rows are never read again but still count toward the cache budget until eviction,
+  which is oldest-first, gets to them.
 - **`curl ... | grep -q` under `set -o pipefail` reports success as failure.** `grep -q`
   exits on its first match and closes the pipe; `curl` then dies with exit 23 and
   pipefail returns that for the whole pipeline. `curl ... | head -c` is the same bug

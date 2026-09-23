@@ -24,6 +24,6 @@ The backend caches whole `/api/sentinel/classify` and `/api/sentinel/analyze` re
 
 **Schema note (2026-07-29):** the supervisor requires **`id` as the primary key on every table**. Columns are now typed per dialect — SQLite must NOT be given a DATE column, as its NUMERIC affinity silently truncates an ISO date at the first dash (`'2024-03-01'` → `2024`). `date_key` deliberately stays a VARCHAR: it holds `"2024-03"` for classify but `"2024-01_2025-01"` for change detection, a month *pair* no DATE can represent; `period_start`/`period_end` hold the parsed form.
 
-**Dead rows:** superseded analysis formats (`analyze`, `analyze_v2`, `analyze_v3`) are never read and never evicted — 12 of 43 rows as of 2026-07-29, each holding base64 PNGs. Cleanup was offered twice and never approved; ask before deleting.
+**Dead rows and eviction:** superseded formats are never read. Since 2026-09-23 the cache is size-bounded, oldest out: past `CACHE_MAX_MB` (default 300 MB of stored size) `cache_put` evicts the oldest rows, so superseded formats -- always older than current ones -- go first. The user chose this over the old never-delete rule to stay clear of Supabase's 500 MB read-only cap. No manual deletes.
 
 Related: [[docker-test-workflow]], [[env-secrets-tracked]], [[backend-hosting-constraints]]

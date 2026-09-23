@@ -597,3 +597,126 @@ def test_classify_subset_served_from_cached_larger_area(sqlite_cache, counted_pi
     img = Image.open(io.BytesIO(base64.b64decode(body["imagePngBase64"])))
     assert img.mode == "RGBA"
     assert (img.width, img.height) == (body["imageWidth"], body["imageHeight"])
+
+
+# ── Size-bounded eviction ─────────────────────────────────────────────────────
+#
+# The cache is oldest-out once its stored size passes CACHE_MAX_MB (the user's
+# choice, 2026-09-23). Supabase's free plan turns the whole database read-only
+# at 500 MB, so without this the cache would eventually stop caching anything.
+
+def _blob(n_bytes: int) -> dict:
+    """A payload whose stored size is about ``n_bytes``."""
+    return {"status": "success", "blob": "x" * n_bytes}
+
+
+def _bbox(i: int) -> tuple:
+    """A distinct ~5 km box per ``i``, so every write gets its own key."""
+    return (90.0 + i * 0.1, 23.7, 90.05 + i * 0.1, 23.75)
+
+
+def _cached_keys(conn) -> set:
+    return {r[0] for r in conn.execute(text(f"SELECT cache_key FROM {cache._TABLE}"))}
+
+
+def _backdate(conn, i: int, hours_ago: int) -> None:
+    ts = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    key = cache.make_key("analyze_v12", "2024-01_2025-01", _bbox(i))
+    conn.execute(text(f"UPDATE {cache._TABLE} SET created_at = :ts WHERE cache_key = :k"),
+                 {"ts": ts, "k": key})
+
+
+def _put(i: int, n_bytes: int = 10_000) -> str:
+    cache.cache_put("analyze_v12", "2024-01_2025-01", _bbox(i), False, _blob(n_bytes))
+    return cache.make_key("analyze_v12", "2024-01_2025-01", _bbox(i))
+
+
+def test_a_cache_under_budget_is_left_alone(sqlite_cache, monkeypatch):
+    monkeypatch.setenv("CACHE_MAX_MB", "1")          # 1 MB, far above 3 x 10 KB
+    keys = {_put(i) for i in range(3)}
+    with cache._get_engine().connect() as conn:
+        assert _cached_keys(conn) == keys
+
+
+def test_oldest_entries_are_evicted_first(sqlite_cache, monkeypatch):
+    monkeypatch.setenv("CACHE_MAX_MB", "0.025")      # room for two ~10 KB rows
+    a, b = _put(0), _put(1)
+    with cache._get_engine().begin() as conn:
+        _backdate(conn, 0, hours_ago=48)             # a is the oldest
+        _backdate(conn, 1, hours_ago=24)
+
+    c = _put(2)
+    with cache._get_engine().connect() as conn:
+        assert _cached_keys(conn) == {b, c}, "the oldest entry must go first"
+
+    d = _put(3)
+    with cache._get_engine().connect() as conn:
+        assert _cached_keys(conn) == {c, d}
+
+
+def test_eviction_stops_as_soon_as_the_rest_fits(sqlite_cache, monkeypatch):
+    monkeypatch.setenv("CACHE_MAX_MB", "0.045")      # room for four ~10 KB rows
+    keys = [_put(i) for i in range(4)]
+    with cache._get_engine().begin() as conn:
+        for i in range(4):
+            _backdate(conn, i, hours_ago=100 - i)
+
+    newest = _put(4)
+    with cache._get_engine().connect() as conn:
+        assert _cached_keys(conn) == set(keys[1:]) | {newest}, "only one row had to go"
+
+
+def test_the_entry_just_written_is_never_evicted(sqlite_cache, monkeypatch):
+    """Eviction makes room for new data; it must not throw the new data away."""
+    monkeypatch.setenv("CACHE_MAX_MB", "0.005")      # smaller than a single row
+    a = _put(0)
+    with cache._get_engine().connect() as conn:
+        assert _cached_keys(conn) == {a}
+
+    b = _put(1)
+    with cache._get_engine().connect() as conn:
+        assert _cached_keys(conn) == {b}
+    assert cache.cache_get("analyze_v12", "2024-01_2025-01", _bbox(1), is_current=False) is not None
+
+
+def test_eviction_takes_class_rows_but_keeps_the_map(sqlite_cache, monkeypatch):
+    monkeypatch.setenv("CACHE_MAX_MB", "0.005")      # less than one blob: everything older must go
+    cache.cache_put("classify_v3", "2024-03", (90.0, 23.7, 90.2, 23.9), False,
+                    {"status": "success", "classes": _CLASSES},
+                    extras=_grid_extras([["Tree"]]))
+    with cache._get_engine().begin() as conn:
+        conn.execute(text(f"UPDATE {cache._TABLE} SET created_at = :ts"),
+                     {"ts": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()})
+
+    _put(1)
+
+    with cache._get_engine().connect() as conn:
+        kinds = {r[0] for r in conn.execute(text(f"SELECT analysis FROM {cache._TABLE}"))}
+        assert kinds == {"analyze_v12"}, "the older classify response should have been evicted"
+        assert _class_rows(conn) == [], "its class breakdown goes with it"
+        assert list(_points(conn).values()) == ["Tree"], "the map outlives the response"
+
+
+def test_a_failed_eviction_keeps_the_new_entry(sqlite_cache, monkeypatch):
+    def boom(engine, keep_key):
+        raise RuntimeError("database hiccup")
+
+    monkeypatch.setattr(cache, "_evict_oldest", boom)
+    _put(0)
+    assert cache.cache_get("analyze_v12", "2024-01_2025-01", _bbox(0), is_current=False) is not None
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 300_000_000),
+    ("450", 450_000_000),
+    ("0.5", 500_000),
+    ("abc", 300_000_000),
+    ("0", 300_000_000),
+    ("-20", 300_000_000),
+])
+def test_cache_budget_comes_from_cache_max_mb(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("CACHE_MAX_MB", raising=False)
+    else:
+        monkeypatch.setenv("CACHE_MAX_MB", raw)
+    assert cache._cache_budget_bytes() == expected

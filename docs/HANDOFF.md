@@ -307,8 +307,9 @@ org.gradle.jvmargs=-Xmx2048m
 - **Do not `git push`** unless told to in that specific message. The user pushes.
 - **Ask before implementing anything ambiguous.** Do not settle a design question with
   your own choice.
-- **Do not delete rows from `analysis_cache`.** Offered three times, declined each
-  time. 32 rows in superseded formats hold ~64 MB. Leave them.
+- **`analysis_cache` is size-bounded, oldest out** (decided 2026-09-23, replacing
+  never-delete). Past `CACHE_MAX_MB` (default 300) the oldest results are evicted
+  automatically. That is the only deletion path; no manual deletes.
 - **Never print secret values.**
 - The user has explicitly declined parallelising the Sentinel Hub fetch loops - "that
   fetching wait is acceptable". Do not re-propose it unprompted.
